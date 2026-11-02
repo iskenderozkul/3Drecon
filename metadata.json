@@ -1,0 +1,4 @@
+{
+  "name": "3D Scanner & Reconstruction",
+  "description": "Real-time monocular dense 3D reconstruction: ARCore tracking, NEON Census/SGM stereo depth, TSDF voxel hashing fusion, incremental Marching Cubes and GLES 3.0 rendering, with OBJ/PLY export."
+}

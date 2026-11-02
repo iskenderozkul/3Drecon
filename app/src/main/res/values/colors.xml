@@ -1,0 +1,6 @@
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="teal_accent">#FF00E5FF</color>
+    <color name="dark_bg">#FF121212</color>
+</resources>

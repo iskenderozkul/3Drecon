@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.Mobile3DRecon" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#FF121212</item>
+        <item name="android:navigationBarColor">#FF121212</item>
+    </style>
+</resources>
