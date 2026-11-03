@@ -1,5 +1,10 @@
 # Mobile 3D Scanner — Monocular Dense Reconstruction (Android)
 
+> **⬇ [En güncel APK'yı indir — 3Drecon-latest.apk](https://github.com/iskenderozkul/3Drecon/raw/main/dist/3Drecon-latest.apk)**
+> *(Download the latest APK. Bu bağlantı her zaman repodaki en son derlemeyi verir.)*
+>
+> Android 8.0+ · ARCore (Google Play Services for AR) gerekli.
+
 Real-time dense 3D reconstruction on a phone: ARCore provides live 6DoF tracking,
 camera frames and intrinsics; Google's Apache-2.0 **Tango 3D Reconstruction** core
 fuses the ARCore depth stream into a projective TSDF and extracts a coloured mesh.
@@ -28,8 +33,9 @@ The Gradle wrapper must run on JDK 17+. Android Studio uses its bundled JDK auto
 from a plain shell set `JAVA_HOME` first, e.g.
 `JAVA_HOME="C:/Program Files/Android/Android Studio/jbr" ./gradlew :app:assembleDebug`.
 
-A ready-built debug APK is committed at `dist/3Drecon_2026-11-02.apk`, so it can be
-downloaded directly on the phone without a local build.
+A ready-built debug APK is committed at `dist/3Drecon-latest.apk`, so it can be
+downloaded directly on the phone without a local build. Every new version replaces
+that file, so the link at the top of this README always points to the current build.
 
 On first launch the app asks for camera permission, installs/updates ARCore if needed,
 and starts scanning automatically. Point the phone around the room; the fused surface
