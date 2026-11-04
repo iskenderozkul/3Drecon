@@ -93,7 +93,7 @@ blend between the measurement and the previous fused surface warped into the cur
   is used directly, but every pixel keeps its accumulated confidence. Reseeding on a pose
   jump was what silently disabled the filter during normal scanning. The dense log line
   carries cumulative `seed=`, `run=` and `wskip=` counters plus the last `rel=`/`ang=`, so
-  a dead filter is visible in `scan.txt` rather than only in the mesh.
+  a dead filter is visible in the session log rather than only in the mesh.
 - Remaining holes are filled by a joint-bilateral pass guided by CPU luma resampled onto
   the depth grid: a pixel is closed only from neighbours with a similar colour and a
   consistent depth, so a doorway or a rim is not bridged. This is where the colour image
@@ -104,30 +104,26 @@ blend between the measurement and the previous fused surface warped into the cur
 This is the part that removes the lumpy, "melted" ground seen on grazing pavement: the
 sensor's per-frame noise is averaged in time before marching cubes ever triangulates it.
 
-### One-tap test run
+### Session log and safe mode
 
-The `TEST` bar sits above the control bar, so a run never needs a menu:
+There is no test button. Every launch writes a continuous log to
+`Android/data/com.example.mobile3drecon/files/logs/scan_<timestamp>.txt`: startup stages
+(`activity_created`, camera permission, ARCore install), then metrics and engine
+diagnostics twice per second while the scanner runs. The newest 12 logs are kept. A
+normal exit appends `session_end=clean`.
 
-1. `Başlat` — clears the volume, starts scanning, switches to AR mode and opens the log.
-2. Scan the room.
-3. `Bitir` — stops scanning and packs everything the run produced into a single
-   `test_<timestamp>.zip`, then opens the system share sheet. WhatsApp accepts it as a
-   document.
+If the process dies instead — native crash, OOM kill, hang — that line is missing. On the
+next launch the app opens in **safe mode** before touching ARCore: it shows that the
+previous session ended unexpectedly and offers its log as a text file through the system
+share sheet (WhatsApp accepts it), or continues to the scanner. Uncaught Java exceptions
+are additionally written to `crash/java_crash_<stamp>.txt` and are appended to the shared
+log when they are newer than the session.
 
-Archive contents:
-
-| Entry | What it is |
-|---|---|
-| `scan.txt` | Header (device, Android, ABI, depth-API support) plus one line per fused frame — `dense ts= src=t3dr dep=WxH feed=WxH valid= dmin dmed dmax tris seg pend dyn ms fuse upd ex pos lag K=fx,fy,cx,cy seed= run= wskip= rel= ang=` on the Tango path (`feed` is the grid actually handed to the reconstruction, `fuse` the temporal-filter cost, `seed/run/wskip` the cumulative filter outcomes and `rel/ang` the last pose step in metres/radians) (`tris` is the Tango mesh triangle count, `seg` the number of cached 16³ grid segments, `pend` the segment backlog still waiting to be extracted, `upd` the last `updateFromDepthImage` cost, `ex` the last segment-extraction cost, `dyn` the share of pixels the motion detector marked), `dense ts= ... blocks= ... carved=` only if the engine fell back to the legacy TSDF, `kf= ts= src= cam= dep= valid= dmin dmed dmax tris blocks ms pos yaw dh= ddt=` on the MVS path — `skip=jump/dup/nodepth/thinDepth/sparse` rejections (duplicates are summarised once a second with a count), and engine counters every 500 ms. `ddt` is how many milliseconds the depth image trails the camera frame (`nan` when the image carries no timestamp, so "unknown" cannot be read as a real 0 ms lag); `lag` is the same value in the dense line. |
-| `mesh.obj` | The fused surface, welded and debris-filtered. |
-| `screen.png` | What the user saw: the AR layer (camera feed + fused surface) copied separately from the HUD layer and composited, because the window capture alone leaves the SurfaceView transparent. |
-| `depth.png`, `confidence.png` | The last depth and confidence maps, upscaled 4×. |
-| `summary.txt` | Duration, render mode, final counters, device capability lines (`ram_mb`, `heap_max_mb`), whether a crash report was included, and which entries were written. |
-| `crash/*.txt` | Present only after a fatal crash. Native signals (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) write the signal, fault address, unwound PC list and `/proc/self/maps`; uncaught Java exceptions write the thread and full stack trace. The newest three reports are attached to the next bundle. |
-
-The individual files are deleted once the archive exists, so there is only ever one
-file to forward. The crash handler is what makes the balcony / TV-reflection / ceiling
-crashes diagnosable: before it, the process died without leaving anything to inspect.
+An earlier build installed a native SIGSEGV handler to capture native crashes. It
+replaced ART's own fault handler, so the app crashed immediately at startup, and it was
+removed. The session log replaces it: after a native crash it still shows the last stage
+reached, the last fused frames and the engine counters, which is what makes the crash
+diagnosable from the shared file alone.
 
 ## Pipeline
 
@@ -143,13 +139,12 @@ crashes diagnosable: before it, the process died without leaving anything to ins
 | Rendering | `gl/renderer.cpp` | GLES 3.0: camera background (`samplerExternalOES` + ARCore UV transform), persistent mesh VBO/EBO, a second VBO for the moving-surface quads, wireframe/normal/depth-heatmap modes, world-locked anchor markers. In AR mode the surface is a **depth-tested, 50 % translucent overlay**: depth testing keeps a single nearest shell on screen (so overlapping sheets cannot turn into a mottled haze) and alpha blending lets the real camera image show through, instead of covering every object like an opaque blanket. Wireframe, normals and depth modes stay opaque. The moving-surface mesh is drawn in amber; both meshes only re-upload when their version counter changes. |
 | Export | `io/exporter.cpp` | Wavefront OBJ with vertex colours and normals, or Stanford PLY (ASCII, coloured). Before writing, vertices are welded on a 1 mm grid (the mesher keeps a copy per 8³ block, so an unwelded export carried 1.0M vertices for 279k positions), normals are averaged per welded vertex, zero-area triangles are dropped and components under 8 triangles — silhouettes only one viewpoint ever saw — are removed. Disconnected pieces are then judged on real triangle connectivity: anything under 12 triangles and 4 cm across is debris and goes, so a chair, a plant or a separate wall chunk survives instead of being deleted as a "second surface". A final edge-collapse pass shrinks triangles only where the surface is locally flat, which makes the resolution adaptive: flat panels merge up to 8.5 cm facets while curvature and colour changes stop the merge (2.5 mm plane tolerance, 5.7° normal agreement, colour guard, link condition and no-fold checks); open-boundary vertices never move, so silhouettes stay exact. The caps sit just above one grid cell because an earlier 4.2 cm cap left a 3.5 cm median edge on a 3 cm grid and turned flat panels into 10 cm facets. Finally, boundary rims of at most 32 vertices and 12 cm are closed with a fan to their centroid — a real scan is sprinkled with one-triangle dropouts and decimation slits, and two thousand three-edge rims read as a torn mesh even when every neighbourhood is fine; of the measured rims 76 % were under 6 cm while everything past 10 cm was a real silhouette (rim length jumps by 20 m per extra 5 cm of threshold), so those stay open. Files land in `Android/data/com.example.mobile3drecon/files/exports/` and are shared via FileProvider. |
 | Moving objects | `core/engine.cpp`, `gl/renderer.cpp` | Every cleaned depth frame is warped into the current camera with the relative ARCore pose (previous pixel → world → current camera) and compared with the depth measured now. A residual above max(8 cm, 3.5 %·z) — widened by 35 % on a street — scores the pixel; it must stay inconsistent for **three consecutive frames** and belong to a connected patch of **at least 96 pixels** before it counts as dynamic. Those pixels are excluded from the feed the static volume sees, so a person or vehicle cannot smear the room, while the static background behind them stays untouched because an invalid pixel writes nothing. The connected-component rule is what removes the scattered amber squares that single noisy pixels around ground silhouettes used to produce. The same pixels become a second mesh of camera-facing quads (capped at 4096, amber) rebuilt each frame and drawn with the static surface; the depth behind it is real, so the layer sits at the correct distance without a second TSDF volume. |
-| Test run | `core/engine.cpp`, `recon/ScanLog.kt`, `recon/TestSession.kt`, `ui/components/TestBar.kt` | `TEST → Başlat` on the main screen starts the log; `Bitir` stops scanning and writes one `test_<timestamp>.zip` with `scan.txt`, `mesh.obj`, `screen.png`, `depth.png`, `confidence.png` and `summary.txt`, then opens the share sheet. The log holds one line per fused frame (source, depth resolution, valid-pixel %, min/median/max depth, triangles, segments, backlog, extraction cost, dynamic share, ms), `skip=jump/dup/nodepth/thinDepth/sparse` lines and engine counters twice per second. |
+| Session log | `recon/ScanLog.kt`, `MainActivity.kt` | Started in `onCreate`, stopped in `onDestroy` with a `session_end=clean` marker. It records the startup stage, camera/ARCore results, and the engine's per-frame line plus diagnostics every 500 ms. If the newest log on the next launch has no clean-end marker, the activity starts in safe mode and offers that file for sharing instead of starting ARCore. |
 
 The UI polls the native engine twice per second for real statistics (FPS, worker
 processing time, triangle/vertex/keyframe/block counts) and the actual depth and
 confidence preview maps. The HUD also shows which depth source produced the last
-frame (`ARCore depth` / `MVS depth`) and a `REC` badge while the test log is
-recording.
+frame (`ARCore depth` / `MVS depth`) and a `REC` badge while scanning is active.
 
 ## Toward Tesla-style perception
 

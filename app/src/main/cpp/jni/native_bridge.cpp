@@ -2,16 +2,8 @@
 #include <android/log.h>
 #include <jni.h>
 
-#include <csignal>
-#include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <fcntl.h>
 #include <memory>
-#include <signal.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <unwind.h>
 
 #include "core/engine.h"
 #include "gl/renderer.h"
@@ -21,115 +13,6 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
-
-char gCrashDirectory[512] = {0};
-
-const char* signalName(int sig) {
-    switch (sig) {
-        case SIGSEGV: return "SIGSEGV";
-        case SIGABRT: return "SIGABRT";
-        case SIGBUS: return "SIGBUS";
-        case SIGFPE: return "SIGFPE";
-        case SIGILL: return "SIGILL";
-        default: return "SIGNAL";
-    }
-}
-
-// libc's backtrace() only exists from API 33, while the app runs on API 26+,
-// so the unwinder from libunwind (shipped with the NDK) produces the frames.
-struct BacktraceState {
-    void* frames[64];
-    int count;
-};
-
-_Unwind_Reason_Code unwindStep(_Unwind_Context* context, void* arg) {
-    auto* state = static_cast<BacktraceState*>(arg);
-    if (state->count >= 64) return _URC_END_OF_STACK;
-    const uintptr_t ip = _Unwind_GetIP(context);
-    if (ip) state->frames[state->count++] = reinterpret_cast<void*>(ip);
-    return _URC_NO_REASON;
-}
-
-// A fatal native signal leaves no trace otherwise: the process dies before
-// the Java side can run. This writes the signal, fault address and a raw
-// backtrace to a file the next test bundle can carry.
-void nativeCrashHandler(int sig, siginfo_t* info, void*) {
-    char path[640];
-    char line[320];
-    if (gCrashDirectory[0] != '\0') {
-        const time_t now = time(nullptr);
-        struct tm local {};
-        localtime_r(&now, &local);
-        char stamp[32];
-        strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
-        std::snprintf(path, sizeof(path), "%s/native_crash_%s.txt", gCrashDirectory, stamp);
-        const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd >= 0) {
-            std::snprintf(line, sizeof(line),
-                          "signal=%d %s code=%d fault=%p tid=%ld\n", sig, signalName(sig),
-                          info ? info->si_code : 0, info ? info->si_addr : nullptr,
-                          static_cast<long>(syscall(SYS_gettid)));
-            ssize_t ignored = write(fd, line, std::strlen(line));
-            (void)ignored;
-
-            BacktraceState trace{};
-            _Unwind_Backtrace(unwindStep, &trace);
-            for (int i = 0; i < trace.count; ++i) {
-                const int length = std::snprintf(line, sizeof(line), "#%02d pc %p\n", i,
-                                                 trace.frames[i]);
-                if (length > 0) {
-                    ignored = write(fd, line, static_cast<size_t>(length));
-                    (void)ignored;
-                }
-            }
-
-            // Library load addresses let the addresses above be symbolized
-            // offline against the exact build that crashed.
-            const int maps = open("/proc/self/maps", O_RDONLY);
-            if (maps >= 0) {
-                ignored = write(fd, "maps:\n", 6);
-                (void)ignored;
-                char buffer[2048];
-                ssize_t readBytes;
-                while ((readBytes = read(maps, buffer, sizeof(buffer))) > 0) {
-                    ignored = write(fd, buffer, static_cast<size_t>(readBytes));
-                    (void)ignored;
-                }
-                close(maps);
-            }
-            close(fd);
-        }
-    }
-    // Keep the default termination so the system still reports the crash.
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-void installCrashHandler(JNIEnv* env, jobject, jstring directory) {
-    if (!directory) return;
-    const char* chars = env->GetStringUTFChars(directory, nullptr);
-    if (!chars) return;
-    std::snprintf(gCrashDirectory, sizeof(gCrashDirectory), "%s", chars);
-    env->ReleaseStringUTFChars(directory, chars);
-
-    static char altStack[64 * 1024];
-    stack_t stack{};
-    stack.ss_sp = altStack;
-    stack.ss_size = sizeof(altStack);
-    stack.ss_flags = 0;
-    sigaltstack(&stack, nullptr);
-
-    struct sigaction action {};
-    action.sa_sigaction = nativeCrashHandler;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGSEGV, &action, nullptr);
-    sigaction(SIGABRT, &action, nullptr);
-    sigaction(SIGBUS, &action, nullptr);
-    sigaction(SIGFPE, &action, nullptr);
-    sigaction(SIGILL, &action, nullptr);
-    LOGI("native crash reports -> %s", gCrashDirectory);
-}
 
 using recon::Engine;
 using recon::GLRenderer;
@@ -389,8 +272,6 @@ jboolean nativeHasMesh(JNIEnv*, jobject, jlong handle) {
 JNINativeMethod kMethods[] = {
     {"create", "()J", reinterpret_cast<void*>(nativeCreate)},
     {"destroy", "(J)V", reinterpret_cast<void*>(nativeDestroy)},
-    {"installCrashHandler", "(Ljava/lang/String;)V",
-     reinterpret_cast<void*>(installCrashHandler)},
     {"glInit", "(J)Z", reinterpret_cast<void*>(nativeGlInit)},
     {"glShutdown", "(J)V", reinterpret_cast<void*>(nativeGlShutdown)},
     {"submitFrame", "(JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;IIIIJFFFFFFFFFFFZLjava/nio/ByteBuffer;IIIJZ[F)V",

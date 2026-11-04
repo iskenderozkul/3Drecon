@@ -1,7 +1,9 @@
 package com.example.recon
 
 import android.content.Context
+import android.content.Intent
 import android.os.Build
+import androidx.core.content.FileProvider
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
@@ -10,8 +12,10 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Test-run log. Plain text, written line by line from measured engine state,
- * then packed into the run's zip.
+ * Continuous session log, written from the moment the activity starts until it
+ * is destroyed. A crashed or force-killed process leaves the file without the
+ * final `session_end=clean` line, which is how the next launch knows something
+ * went wrong and offers the log for sharing.
  */
 class ScanLog(private val context: Context) {
 
@@ -25,18 +29,20 @@ class ScanLog(private val context: Context) {
 
     fun start(): File? {
         stop()
+        val dir = logDirectory(context)
+        if (!dir.exists() && !dir.mkdirs()) return null
+        prune(dir, keep = 12)
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val target = File(dir, "scan_$stamp.txt")
         return try {
-            val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "logs")
-            if (!dir.exists()) dir.mkdirs()
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val target = File(dir, "scan_$stamp.txt")
             writer = BufferedWriter(FileWriter(target))
             file = target
-            log("# Mobile 3D Scanner diagnostics")
+            log("# Mobile 3D Scanner session")
             log("started=${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())}")
             log("device=${Build.MANUFACTURER} ${Build.MODEL}")
             log("android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT}")
             log("abi=${Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}")
+            log("heap_max_mb=${Runtime.getRuntime().maxMemory() / (1024 * 1024)}")
             target
         } catch (e: Exception) {
             file = null
@@ -52,9 +58,13 @@ class ScanLog(private val context: Context) {
 
     fun log(line: String) {
         val out = writer ?: return
-        out.write(line)
-        out.newLine()
-        out.flush()
+        try {
+            out.write(line)
+            out.newLine()
+            out.flush()
+        } catch (_: Exception) {
+            writer = null
+        }
     }
 
     fun logBlock(text: String) {
@@ -63,13 +73,102 @@ class ScanLog(private val context: Context) {
     }
 
     fun stop(): File? {
-        try {
-            writer?.flush()
-            writer?.close()
-        } catch (_: Exception) {
+        val out = writer
+        val current = file
+        if (out != null) {
+            try {
+                out.write("session_end=clean")
+                out.newLine()
+                out.flush()
+                out.close()
+            } catch (_: Exception) {
+            }
         }
         writer = null
-        return file
+        return current
+    }
+
+    private fun prune(dir: File, keep: Int) {
+        val logs = dir.listFiles { f ->
+            f.isFile && f.name.startsWith("scan_") && f.name.endsWith(".txt")
+        } ?: return
+        if (logs.size < keep) return
+        logs.sortedBy { it.lastModified() }
+            .take(logs.size - keep + 1)
+            .forEach { runCatching { it.delete() } }
+    }
+
+    companion object {
+
+        fun logDirectory(context: Context): File =
+            File(context.getExternalFilesDir(null) ?: context.filesDir, "logs")
+
+        private fun crashDirectory(context: Context): File =
+            File(context.getExternalFilesDir(null) ?: context.filesDir, "crash")
+
+        /**
+         * Returns the newest session log that never reached its clean end, i.e.
+         * the previous run died without shutting down. Null when the last run
+         * ended normally or there is no history yet.
+         */
+        fun findUncleanSession(context: Context): File? {
+            val newest = logDirectory(context)
+                .listFiles { f -> f.isFile && f.name.startsWith("scan_") && f.name.endsWith(".txt") }
+                ?.maxByOrNull { it.lastModified() } ?: return null
+            val tail = runCatching {
+                newest.bufferedReader().use { reader ->
+                    val lines = reader.readLines()
+                    lines.takeLast(60)
+                }
+            }.getOrNull() ?: return null
+            if (tail.any { it.startsWith("session_end=") }) return null
+            if (tail.any { it.startsWith("recovered=yes") }) return null
+            return newest
+        }
+
+        fun markRecovered(file: File) {
+            runCatching { file.appendText("recovered=yes\n") }
+        }
+
+        /**
+         * Packs the crashed session log together with any Java crash report the
+         * process managed to write, then hands the single file to the chooser
+         * (WhatsApp, mail, …) through the FileProvider.
+         */
+        fun shareSessionLog(context: Context, session: File) {
+            val payload = buildString {
+                append(runCatching { session.readText() }.getOrDefault(""))
+                val crash = crashDirectory(context)
+                    .listFiles { f -> f.isFile && f.name.endsWith(".txt") }
+                    ?.maxByOrNull { it.lastModified() }
+                if (crash != null && crash.lastModified() >= session.lastModified()) {
+                    appendLine()
+                    appendLine("--- crash report: ${crash.name} ---")
+                    append(runCatching { crash.readText() }.getOrDefault(""))
+                }
+            }
+            val shareDir = File(context.cacheDir, "share")
+            if (!shareDir.exists()) shareDir.mkdirs()
+            val out = try {
+                File(shareDir, "oturum_${session.name}").also { it.writeText(payload) }
+            } catch (_: Exception) {
+                return
+            }
+            val uri = try {
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", out)
+            } catch (_: Exception) {
+                return
+            }
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_TEXT, "3D Scanner oturum logu ekte.")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(send, "Logu paylaş").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching { context.startActivity(chooser) }
+        }
     }
 }
-

@@ -17,9 +17,6 @@ object NativeRecon {
     external fun create(): Long
     external fun destroy(handle: Long)
 
-    /** Routes fatal native signals to a crash report inside [directory]. */
-    external fun installCrashHandler(directory: String)
-
     external fun glInit(handle: Long): Boolean
     external fun glShutdown(handle: Long)
 
