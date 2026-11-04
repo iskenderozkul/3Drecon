@@ -4,6 +4,8 @@
 > *(Download the latest APK. Bu bağlantı her zaman repodaki en son derlemeyi verir.)*
 >
 > Android 8.0+ · ARCore (Google Play Services for AR) gerekli.
+>
+> **Sürüm v2.1** (versionCode 3) — APK içinde ve oturum logunun başında da yazar.
 
 Real-time dense 3D reconstruction on a phone: ARCore provides live 6DoF tracking,
 camera frames and intrinsics; Google's Apache-2.0 **Tango 3D Reconstruction** core
@@ -52,10 +54,13 @@ the depth measured now; residual pixels must stay inconsistent for three consecu
 frames and form a connected patch of at least 96 pixels before they count as dynamic.
 Those pixels are excluded from the static volume, so a walking person does not smear the
 wall behind them, and a couple of noisy pixels near a silhouette no longer appear as
-stray amber squares. The same patch is published as a second, small camera-facing mesh
-built from the live depth and drawn in amber, so a moving body stays visible and anchored
-to its real distance without a second reconstruction volume. The mask clears as soon as
-the residual goes away.
+stray amber squares. The mask is dilated by one pixel before it reaches the static
+volume, so the contaminated halo around the patch does not stay fused into the wall. The
+same patch is published as a second mesh built from the live depth as one connected
+shared-vertex grid: neighbouring depth samples are joined only across small depth steps,
+normals come from the image-axis tangents and face the camera, and vertices are shared
+between triangles, so the moving body is drawn as a surface instead of a scatter of
+stretched quads. It is amber and clears as soon as the residual goes away.
 
 ### Room or street, chosen automatically
 
@@ -88,6 +93,15 @@ blend between the measurement and the previous fused surface warped into the cur
 - Pixels the sensor drops are held for up to four frames, and only while the pose barely
   changed, so a thin hole in a depth map does not become a hole in the mesh and a pan does
   not paint the old view into the new one.
+- The reconstruction never sees unchecked depth: raw depth is used when available and a
+  pixel is rejected when ARCore's confidence image is below 128, which drops the
+  low-confidence flying pixels that ARCore produces while it smooths across a depth step.
+  If the gate would remove too much of the frame (a textureless wall), it backs off for
+  that frame instead of handing the fusion an empty map. The share of rejected pixels
+  appears as `gate=` in the dense log line.
+- Cleaning tolerances scale with distance and are capped (median 2.5–10 cm, single-pixel
+  fill 2–6 cm), so a ~6 cm object on a table is no longer bridged into a membrane by an
+  absolute centimetre threshold meant for walls.
 - A pose step too large for the warp to be meaningful (relocalisation, a dropped frame)
   drops the prior for that one frame instead of reseeding the whole grid: the measurement
   is used directly, but every pixel keeps its accumulated confidence. Reseeding on a pose
@@ -104,20 +118,40 @@ blend between the measurement and the previous fused surface warped into the cur
 This is the part that removes the lumpy, "melted" ground seen on grazing pavement: the
 sensor's per-frame noise is averaged in time before marching cubes ever triangulates it.
 
+### What the hardware can resolve
+
+The Depth API grid is 160×90 and the reconstruction voxel is 3 cm. A small object lying
+on a table (a mouse is about 6 cm tall) therefore spans roughly two voxels: its top
+surface is measured, but the sensor rarely returns enough angled samples to grow distinct
+side walls between the top and the table. A 1 cm volume would multiply the work by about
+27× and cannot run in real time on this class of phone, so the engine does not promise
+mouse-sized side walls. What it does fix is what produced wrong geometry anyway — phantom
+sheets in mid-air (confidence gating and range-capped cleaning), anchors in the wrong
+place (measured surface or no anchor), and the moving surface being drawn as scattered
+quads (connected grid with shared vertices).
+
 ### Session log and safe mode
 
 There is no test button. Every launch writes a continuous log to
-`Android/data/com.example.mobile3drecon/files/logs/scan_<timestamp>.txt`: startup stages
-(`activity_created`, camera permission, ARCore install), then metrics and engine
-diagnostics twice per second while the scanner runs. The newest 12 logs are kept. A
-normal exit appends `session_end=clean`.
+`Android/data/com.example.mobile3drecon/files/logs/scan_<timestamp>.txt`: app version,
+startup stages (`activity_created`, camera permission, ARCore install), then metrics and
+engine diagnostics twice per second while the scanner runs. The newest 12 logs are kept.
+`LOG` in the top bar shares the current session log at any time — a normal exit is no
+longer required to obtain it.
 
-If the process dies instead — native crash, OOM kill, hang — that line is missing. On the
-next launch the app opens in **safe mode** before touching ARCore: it shows that the
-previous session ended unexpectedly and offers its log as a text file through the system
-share sheet (WhatsApp accepts it), or continues to the scanner. Uncaught Java exceptions
-are additionally written to `crash/java_crash_<stamp>.txt` and are appended to the shared
-log when they are newer than the session.
+The log is closed with `session_end=clean` in `onStop`, i.e. when the app leaves the
+foreground, and the same file is reopened with `session_resume=` when it returns. Swiping
+the app away from recents therefore leaves a finished log rather than an apparently
+crashed one.
+
+If the process really dies — native crash, OOM kill, hang — that line is missing. On the
+next launch, if the newest log is less than 24 hours old, the app opens in **safe mode**
+before touching ARCore: it shows that the previous session ended unexpectedly and offers
+its log as a text file through the system share sheet (WhatsApp accepts it), or continues
+to the scanner. Uncaught Java exceptions are additionally written to
+`crash/java_crash_<stamp>.txt` and are appended to the shared log when they are newer than
+the session. The 24-hour rule exists because an old build's leftover log without a marker
+used to force safe mode after an update.
 
 An earlier build installed a native SIGSEGV handler to capture native crashes. It
 replaced ART's own fault handler, so the app crashed immediately at startup, and it was
@@ -129,7 +163,7 @@ diagnosable from the shared file alone.
 
 | Stage | Where | What actually happens |
 |---|---|---|
-| Tracking & frames | `ar/ReconGlRenderer.kt`, `core/frame.h` | ARCore `Session` at `LATEST_CAMERA_IMAGE`; every tracked frame delivers the YUV_420_888 CPU image (de-strided in JNI), the camera pose quaternion/translation and pinhole intrinsics (scaled to the image size). When the device supports the ARCore Depth API (`Config.DepthMode.AUTOMATIC`), the matching DEPTH16 image is delivered too. Consecutive frames are checked for pose continuity: an apparent speed above 2.5 m/s means ARCore relocalised, so that frame and the next three are not fused. Anchors are placed on real geometry: the screen centre is hit-tested with `Frame.hitTest`, a plane hit is preferred, then a depth point, then any hit; plane finding runs in `HORIZONTAL_AND_VERTICAL` mode. When nothing is hit, the marker falls back to the depth measured under the crosshair (median of a 15×15 patch, 0.25–7.5 m) instead of a fixed 1.2 m guess, so it lands on the wall or table the user is aiming at. |
+| Tracking & frames | `ar/ReconGlRenderer.kt`, `core/frame.h` | ARCore `Session` at `LATEST_CAMERA_IMAGE`; every tracked frame delivers the YUV_420_888 CPU image (de-strided in JNI), the camera pose quaternion/translation and pinhole intrinsics (scaled to the image size). When the device supports the ARCore Depth API (`Config.DepthMode.AUTOMATIC`), the matching depth and confidence images are delivered too (raw depth preferred, smooth depth as a fallback). Consecutive frames are checked for pose continuity: an apparent speed above 2.5 m/s means ARCore relocalised, so that frame and the next three are not fused. Anchors are placed on real geometry: the screen centre is hit-tested with `Frame.hitTest`, a tracked plane hit is preferred and a depth point second; an arbitrary feature-point hit is rejected because it carries no metric depth. If neither exists, the anchor uses the depth measured under the crosshair (median of a 15×15 patch, 0.25–7.5 m). If that is unknown too, no anchor is created and a short notice asks the user to aim at a surface — the old fixed 1.2 m guess is what put markers in mid-air. Plane finding runs in `HORIZONTAL_AND_VERTICAL` mode, and markers are drawn with depth testing disabled so the ring is visible on top of the surface it is attached to. |
 | Reconstruction core (primary) | `tango/tango_recon.cpp`, `tango/tango_recon.h` | Google Tango 3D Reconstruction (Apache 2.0, the same core used by 3DLiveScanner) loaded through `dlopen`. Every held frame is fused with `Tango3DR_updateFromDepthImage`: the raw 16-bit millimetre DEPTH16 map is passed at its native 160×90 together with the ARCore camera pose converted from the OpenGL frame (Y up, −Z forward) to Tango's optical camera frame (Y down, +Z forward) by a 180° rotation about the camera X axis — the same conversion 3DLiveScanner applies. Without it every map fuses mirrored behind the camera. Depth-grid intrinsics are derived from ARCore's texture intrinsics. The colour image is the full 640×480 YUV frame converted to NV21 and paired with its own pinhole intrinsics, so vertex colours are sampled with the correct calibration. Config: **3 cm voxels with a 6 m range**, projective update, space clearing, parallel integration, debris components under 9 vertices removed. It is fed the temporally fused, hole-filled grid (see above); when `updateFromDepthImage` dominates the frame (EMA above 70 ms) the engine halves the feed to 80×45 with matching intrinsics — a quarter of the rays — and returns to full resolution only after three seconds below 20 ms, so the switch cannot flap. Tango does its own visibility clearing and marching cubes; we only cache the 16³ grid segments it reports as changed and publish the concatenated mesh as an immutable snapshot. Extract order and cadence are what make the surface appear quickly: every segment the update reports is pushed into a nearest-first priority queue (deduplicated by grid key), and each frame spends at most a 30 ms slice extracting it, so the surface in front of the camera materialises first while fusion keeps its frame budget. Remaining segments publish every 0.15 s; a backlog above **768** segments is dropped and re-enters the queue the next time the depth frame touches it, so a fast sweep cannot build a multi-second lag between what the user aims at and what is on screen (the previous 4096 cap let the queue climb to 1400–3100 cells and the visible mesh fell behind the volume). Extracted cells are validated before they are copied: a null buffer, an implausible vertex/face count or an out-of-range face index is rejected instead of dereferenced, and the cached display copy is capped at **1500 cells / 1 000 000 vertices**, dropping the cells farthest from the current camera first, so a long outdoor walk cannot grow the published mesh without bound (the core volume keeps its state). The exporter refuses a full-volume extraction above 3 000 000 vertices / 5 000 000 faces rather than doubling peak memory. If the library cannot be loaded, the engine logs `t3dr=unavailable fallback=legacy` and uses the self-written TSDF path below. |
 | Keyframes | `core/keyframe_manager.cpp` | **MVS path only** — the ARCore-depth path integrates every frame and does not gate on keyframes. Sliding reference window of 14 keyframes plus a lifetime counter. A new keyframe is taken at most every 0.25 s and only once the baseline exceeds 15 cm or the view rotates by 8°; near-duplicate viewpoints cost 50–300 ms of fusion each without adding information. Reference selection follows Mobile3DRecon Eqs. (1)–(3): `wb = exp(−(b−0.6)²/0.2²)` around a 0.6 m baseline and `wv = max(10°/α, 1)`; the top two references are kept and weighted `S/ΣS` in the cost (Eq. 7). References beyond 75° are rejected as uninformative. |
 | Depth input | `mvs/census.cpp`, `mvs/stereo.cpp`, `core/engine.cpp` | **Primary: ARCore Depth API.** On the Tango path the *cleaned* copy is fused: the same map that drives previews and statistics is handed to the reconstruction core, so median-rejected flyers and moving pixels never enter the static volume. `prepareDepthGrid` converts millimetres to metres (0.05–6 m), runs a 3×3 median, rejects a centre sample that departs from its neighbourhood by more than max(4 cm, 5 % of depth) as a flying pixel on a silhouette, and fills a single-pixel dropout only when at least six neighbours agree within 8 cm. A frame with under 4 % valid depth is skipped — indoors the map is usually dense, and the old 12.5 % gate delayed meshing until the user walked back inside. Samples past 6 m are dropped for every scene (ARCore depth is unreliable at that range and the reconstruction stops there anyway), and when the scene is classified as a street isolated pixels without two valid neighbours are also removed, because sunlight and glossy asphalt return single-pixel speckles that the 3×3 median cannot see. A depth image that trails the camera by more than 400 ms — or by more than 20 cm at the current walking speed — is not fused against the current pose. The depth map is aligned to the camera texture, not the 4:3 CPU image, so unprojection uses ARCore's texture intrinsics scaled to the depth resolution and colour is sampled through the measured image-region affine — exactly what Google's raw-depth sample does. **Fallback when the device has no depth support:** half-resolution (320×240) 64-bit Census (8×8 minus centre, NEON `VCNT` Hamming), weighted multi-view cost over 96 inverse-depth planes in [0.3 m, 3.0 m], epipolar projection `K1 R1ᵀ R0 K0⁻¹`, 8-path SGM with gradient-adaptive `P2 = 40 + 0.45·|∇I|`, parabolic sub-pixel refinement, then a continuous ±1-plane photometric search with bilinear luma sampling. The match is kept only if the reference keyframe's own depth agrees (forward-backward check); confidence combines the photometric cost-valley sharpness with the 5×5 sub-level label disagreement `ω` (Eqs. 13–14) and drops `M < 0.15`. Results under 5 % valid pixels are discarded. |
@@ -139,7 +173,7 @@ diagnosable from the shared file alone.
 | Rendering | `gl/renderer.cpp` | GLES 3.0: camera background (`samplerExternalOES` + ARCore UV transform), persistent mesh VBO/EBO, a second VBO for the moving-surface quads, wireframe/normal/depth-heatmap modes, world-locked anchor markers. In AR mode the surface is a **depth-tested, 50 % translucent overlay**: depth testing keeps a single nearest shell on screen (so overlapping sheets cannot turn into a mottled haze) and alpha blending lets the real camera image show through, instead of covering every object like an opaque blanket. Wireframe, normals and depth modes stay opaque. The moving-surface mesh is drawn in amber; both meshes only re-upload when their version counter changes. |
 | Export | `io/exporter.cpp` | Wavefront OBJ with vertex colours and normals, or Stanford PLY (ASCII, coloured). Before writing, vertices are welded on a 1 mm grid (the mesher keeps a copy per 8³ block, so an unwelded export carried 1.0M vertices for 279k positions), normals are averaged per welded vertex, zero-area triangles are dropped and components under 8 triangles — silhouettes only one viewpoint ever saw — are removed. Disconnected pieces are then judged on real triangle connectivity: anything under 12 triangles and 4 cm across is debris and goes, so a chair, a plant or a separate wall chunk survives instead of being deleted as a "second surface". A final edge-collapse pass shrinks triangles only where the surface is locally flat, which makes the resolution adaptive: flat panels merge up to 8.5 cm facets while curvature and colour changes stop the merge (2.5 mm plane tolerance, 5.7° normal agreement, colour guard, link condition and no-fold checks); open-boundary vertices never move, so silhouettes stay exact. The caps sit just above one grid cell because an earlier 4.2 cm cap left a 3.5 cm median edge on a 3 cm grid and turned flat panels into 10 cm facets. Finally, boundary rims of at most 32 vertices and 12 cm are closed with a fan to their centroid — a real scan is sprinkled with one-triangle dropouts and decimation slits, and two thousand three-edge rims read as a torn mesh even when every neighbourhood is fine; of the measured rims 76 % were under 6 cm while everything past 10 cm was a real silhouette (rim length jumps by 20 m per extra 5 cm of threshold), so those stay open. Files land in `Android/data/com.example.mobile3drecon/files/exports/` and are shared via FileProvider. |
 | Moving objects | `core/engine.cpp`, `gl/renderer.cpp` | Every cleaned depth frame is warped into the current camera with the relative ARCore pose (previous pixel → world → current camera) and compared with the depth measured now. A residual above max(8 cm, 3.5 %·z) — widened by 35 % on a street — scores the pixel; it must stay inconsistent for **three consecutive frames** and belong to a connected patch of **at least 96 pixels** before it counts as dynamic. Those pixels are excluded from the feed the static volume sees, so a person or vehicle cannot smear the room, while the static background behind them stays untouched because an invalid pixel writes nothing. The connected-component rule is what removes the scattered amber squares that single noisy pixels around ground silhouettes used to produce. The same pixels become a second mesh of camera-facing quads (capped at 4096, amber) rebuilt each frame and drawn with the static surface; the depth behind it is real, so the layer sits at the correct distance without a second TSDF volume. |
-| Session log | `recon/ScanLog.kt`, `MainActivity.kt` | Started in `onCreate`, stopped in `onDestroy` with a `session_end=clean` marker. It records the startup stage, camera/ARCore results, and the engine's per-frame line plus diagnostics every 500 ms. If the newest log on the next launch has no clean-end marker, the activity starts in safe mode and offers that file for sharing instead of starting ARCore. |
+| Session log | `recon/ScanLog.kt`, `MainActivity.kt` | Started in `onCreate` with the app version and startup stages, suspended with `session_end=clean` in `onStop`, reopened on `onStart`, stopped in `onDestroy`. It records the engine's per-frame line plus diagnostics every 500 ms, and `LOG` in the HUD shares the live file immediately. If the newest log on the next launch is under 24 hours old and has no clean-end marker, the activity starts in safe mode and offers that file for sharing instead of starting ARCore. |
 
 The UI polls the native engine twice per second for real statistics (FPS, worker
 processing time, triangle/vertex/keyframe/block counts) and the actual depth and

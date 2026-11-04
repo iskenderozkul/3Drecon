@@ -126,10 +126,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (this::sessionLog.isInitialized) sessionLog.resume()
+    }
+
     override fun onResume() {
         super.onResume()
         sessionLog.log("stage=activity_resumed")
         if (crashedSession == null && cameraGranted && !arReady) ensureArCore()
+    }
+
+    /**
+     * Closing the log here means a normal exit (including swiping the app away
+     * from recents) always leaves a finished, shareable file. Without this the
+     * user had to wait for a crash to get a log at all.
+     */
+    override fun onStop() {
+        if (this::sessionLog.isInitialized) {
+            sessionLog.log("stage=activity_stopped")
+            sessionLog.suspend("background")
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {

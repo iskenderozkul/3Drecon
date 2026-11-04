@@ -78,7 +78,10 @@ void nativeSubmitFrame(JNIEnv* env, jobject, jlong handle,
                        jboolean tracking,
                        jobject depthBuf, jint depthRowStride,
                        jint depthWidth, jint depthHeight, jlong depthTimestampNs,
-                       jboolean depthApiActive, jfloatArray depthInfoArr) {
+                       jboolean depthApiActive,
+                       jobject confidenceBuf, jint confidenceRowStride,
+                       jint confidencePixelStride, jint confidenceWidth, jint confidenceHeight,
+                       jfloatArray depthInfoArr) {
     auto* c = ctx(handle);
     if (!c || width <= 1 || height <= 1) return;
 
@@ -120,6 +123,46 @@ void nativeSubmitFrame(JNIEnv* env, jobject, jlong handle,
                 if (offset + rowBytes > capacity) break;
                 std::memcpy(frame.depthMm.data() + static_cast<size_t>(r) * depthWidth,
                             dPtr + offset, static_cast<size_t>(rowBytes));
+            }
+        }
+    }
+
+    // Confidence grid: one byte per depth pixel. Only copied when it matches
+    // the depth size, so a mismatched pair can never mask the wrong pixels.
+    if (confidenceBuf && confidenceWidth == depthWidth && confidenceHeight == depthHeight &&
+        confidenceWidth > 1 && confidenceHeight > 1 && confidencePixelStride > 0) {
+        const int need = (confidenceWidth - 1) * confidencePixelStride + 1;
+        if (confidenceRowStride >= need) {
+            const auto* cPtr =
+                static_cast<const uint8_t*>(env->GetDirectBufferAddress(confidenceBuf));
+            const jlong capacity = env->GetDirectBufferCapacity(confidenceBuf);
+            if (cPtr && capacity > 0) {
+                frame.confidence.assign(
+                    static_cast<size_t>(confidenceWidth) * confidenceHeight, 0);
+                bool complete = true;
+                for (int r = 0; r < confidenceHeight && complete; ++r) {
+                    const jlong offset = static_cast<jlong>(r) * confidenceRowStride;
+                    if (offset + need > capacity) {
+                        complete = false;
+                        break;
+                    }
+                    uint8_t* out = frame.confidence.data() +
+                                   static_cast<size_t>(r) * confidenceWidth;
+                    const uint8_t* row = cPtr + offset;
+                    if (confidencePixelStride == 1) {
+                        std::memcpy(out, row, static_cast<size_t>(confidenceWidth));
+                    } else {
+                        for (int c = 0; c < confidenceWidth; ++c) {
+                            out[c] = row[static_cast<int64_t>(c) * confidencePixelStride];
+                        }
+                    }
+                }
+                if (complete) {
+                    frame.confidenceWidth = confidenceWidth;
+                    frame.confidenceHeight = confidenceHeight;
+                } else {
+                    frame.confidence.clear();
+                }
             }
         }
     }
@@ -274,7 +317,7 @@ JNINativeMethod kMethods[] = {
     {"destroy", "(J)V", reinterpret_cast<void*>(nativeDestroy)},
     {"glInit", "(J)Z", reinterpret_cast<void*>(nativeGlInit)},
     {"glShutdown", "(J)V", reinterpret_cast<void*>(nativeGlShutdown)},
-    {"submitFrame", "(JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;IIIIJFFFFFFFFFFFZLjava/nio/ByteBuffer;IIIJZ[F)V",
+    {"submitFrame", "(JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;IIIIJFFFFFFFFFFFZLjava/nio/ByteBuffer;IIIJZLjava/nio/ByteBuffer;IIII[F)V",
      reinterpret_cast<void*>(nativeSubmitFrame)},
     {"render", "(JI[F[F[FIII[F)Z", reinterpret_cast<void*>(nativeRender)},
     {"getStats", "(J[F[I)V", reinterpret_cast<void*>(nativeGetStats)},

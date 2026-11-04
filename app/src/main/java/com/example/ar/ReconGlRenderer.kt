@@ -49,6 +49,8 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
     @Volatile private var centerDepthM: Float = 0f
 
     var onError: ((String) -> Unit)? = null
+    // Anchor requested while the crosshair had no measured surface under it.
+    var onAnchorFailure: ((String) -> Unit)? = null
 
     private var cameraTextureId = 0
     private var textureBound = false
@@ -212,12 +214,23 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
 
         // ARCore depth is optional: acquisition throws until the Depth API has
         // warmed up, and devices without support never produce an image.
+        //
+        // Raw depth + confidence is the reconstruction input: the confidence
+        // marks flying pixels on silhouettes and the values ARCore blended
+        // across a depth step, which are the sheets that used to appear in
+        // mid-air. The smoothed image is the fallback when raw depth is not
+        // available on the device.
         var depthImage: Image? = null
+        var confidenceImage: Image? = null
         if (depthApiEnabled) {
-            depthImage = try {
-                frame.acquireDepthImage16Bits()
-            } catch (e: Exception) {
-                null
+            depthImage = runCatching { frame.acquireRawDepthImage16Bits() }.getOrNull()
+            confidenceImage = runCatching { frame.acquireRawDepthConfidenceImage() }.getOrNull()
+            if (depthImage == null || confidenceImage == null) {
+                runCatching { depthImage?.close() }
+                runCatching { confidenceImage?.close() }
+                depthImage = null
+                confidenceImage = null
+                depthImage = runCatching { frame.acquireDepthImage16Bits() }.getOrNull()
             }
         }
 
@@ -238,6 +251,7 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
             val u = image.planes[1]
             val v = image.planes[2]
             val dPlane = depthImage?.planes?.getOrNull(0)
+            val cPlane = confidenceImage?.planes?.getOrNull(0)
             if (depthImage != null) {
                 updateDepthTransform(frame, image.width, image.height)
                 updateDepthIntrinsics(camera, depthImage.width, depthImage.height)
@@ -258,6 +272,8 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
                 depthImage?.width ?: 0, depthImage?.height ?: 0,
                 depthImage?.timestamp ?: 0L,
                 depthApiEnabled,
+                cPlane?.buffer, cPlane?.rowStride ?: 0, cPlane?.pixelStride ?: 0,
+                confidenceImage?.width ?: 0, confidenceImage?.height ?: 0,
                 depthInfo
             )
         } finally {
@@ -265,6 +281,7 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
             // the finally block; that exception would escape the GL thread.
             runCatching { image.close() }
             runCatching { depthImage?.close() }
+            runCatching { confidenceImage?.close() }
         }
     }
 
@@ -422,9 +439,15 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
             // the screen centre and prefer plane hits, because an anchor on the
             // camera pose sits inside the phone and is invisible at any depth.
             val anchor = placeSurfaceAnchor(session, camera, frame)
-            anchorSeq++
-            anchors.add(AnchorEntry(anchorSeq, anchor, "Anchor $anchorSeq"))
-            changed = true
+            if (anchor != null) {
+                anchorSeq++
+                anchors.add(AnchorEntry(anchorSeq, anchor, "Anchor $anchorSeq"))
+                changed = true
+            } else {
+                onAnchorFailure?.invoke(
+                    "Nişangahın altında ölçülmüş yüzey yok. Masaya ya da duvara doğrultup tekrar dene."
+                )
+            }
         }
 
         while (true) {
@@ -443,7 +466,7 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
         if (changed) updateAnchorSnapshot()
     }
 
-    private fun placeSurfaceAnchor(session: Session, camera: Camera, frame: Frame): Anchor {
+    private fun placeSurfaceAnchor(session: Session, camera: Camera, frame: Frame): Anchor? {
         val centreX = viewportWidth / 2f
         val centreY = viewportHeight / 2f
         val hits = runCatching { frame.hitTest(centreX, centreY) }.getOrDefault(emptyList())
@@ -451,18 +474,21 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
             it.trackable is Plane && it.trackable.trackingState == TrackingState.TRACKING
         }
         val depthHit = hits.firstOrNull { it.trackable is DepthPoint }
-        val hit = planeHit ?: depthHit ?: hits.firstOrNull()
+        // A feature-point hit has no metric depth, and a guessed distance puts
+        // the marker in mid-air inside a wall. Only measured surfaces qualify.
+        val hit = planeHit ?: depthHit
         if (hit != null) {
             runCatching { hit.createAnchor() }.getOrNull()?.let { return it }
         }
-        // No surface under the crosshair yet: place the anchor at the depth the
-        // sensor measures under the crosshair, so it lands on the wall or table
-        // the user is aiming at instead of a guessed 1.2 m.
+        // No plane or depth point under the crosshair yet: use the sensor depth
+        // measured under it, and refuse the anchor when even that is unknown.
         val measured = centerDepthM
-        val distance = if (measured > 0.25f && measured < 7.5f) measured else 1.2f
-        return session.createAnchor(
-            camera.pose.compose(Pose.makeTranslation(0f, 0f, -distance))
-        )
+        if (measured < 0.25f || measured > 7.5f) return null
+        return runCatching {
+            session.createAnchor(
+                camera.pose.compose(Pose.makeTranslation(0f, 0f, -measured))
+            )
+        }.getOrNull()
     }
 
     private fun updateAnchorSnapshot() {

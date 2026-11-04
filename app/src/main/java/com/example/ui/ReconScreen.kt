@@ -35,6 +35,7 @@ import com.example.ui.components.ReconControlBar
 import com.example.ui.components.ReconHud
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.RoseError
+import com.example.ui.theme.TextSecondary
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -51,6 +52,15 @@ fun ReconScreen(scanLog: ScanLog) {
     var showExportSheet by remember { mutableStateOf(false) }
     var showAnchorSheet by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var notice by remember { mutableStateOf<String?>(null) }
+
+    // Anchor failures are transient guidance, unlike the persistent error card.
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            delay(4000)
+            notice = null
+        }
+    }
 
     val exportSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val anchorSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -93,6 +103,10 @@ fun ReconScreen(scanLog: ScanLog) {
                         errorMessage = message
                         scanLog.log("error=$message")
                     }
+                    onAnchorFailure = { message ->
+                        notice = message
+                        scanLog.log("anchor_failed=$message")
+                    }
                 }
             },
             modifier = Modifier.fillMaxSize()
@@ -102,6 +116,10 @@ fun ReconScreen(scanLog: ScanLog) {
             metrics = metrics,
             anchorCount = anchors.size,
             recording = metrics.scanning,
+            onShareLog = {
+                val current = scanLog.currentFile()
+                if (current != null) ScanLog.shareSessionLog(context, current)
+            },
             modifier = Modifier.align(Alignment.TopCenter)
         )
 
@@ -118,6 +136,23 @@ fun ReconScreen(scanLog: ScanLog) {
                     color = RoseError,
                     fontSize = 13.sp,
                     modifier = Modifier.padding(16.dp)
+                )
+            }
+        }
+
+        notice?.let { message ->
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 88.dp, start = 24.dp, end = 24.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = DarkSurface.copy(alpha = 0.92f)
+            ) {
+                Text(
+                    text = message,
+                    color = TextSecondary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
                 )
             }
         }

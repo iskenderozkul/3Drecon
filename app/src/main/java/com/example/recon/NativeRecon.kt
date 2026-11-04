@@ -31,6 +31,8 @@ object NativeRecon {
         tracking: Boolean,
         depth: ByteBuffer?, depthRowStride: Int, depthWidth: Int, depthHeight: Int,
         depthTimestampNs: Long, depthApiActive: Boolean,
+        confidence: ByteBuffer?, confidenceRowStride: Int, confidencePixelStride: Int,
+        confidenceWidth: Int, confidenceHeight: Int,
         depthInfo: FloatArray
     )
 

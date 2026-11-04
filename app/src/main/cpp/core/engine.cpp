@@ -776,19 +776,27 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
         }
 
         char line[512];
+        char gateText[16];
+        const float gateReject = lastConfidenceReject_.load();
+        if (gateReject < 0.f) {
+            std::snprintf(gateText, sizeof(gateText), "off");
+        } else {
+            std::snprintf(gateText, sizeof(gateText), "%.0f%%",
+                          static_cast<double>(gateReject));
+        }
         const double dynamicPct =
             depth_.depth.empty()
                 ? 0.0
                 : 100.0 * static_cast<double>(movingPixels) /
                       static_cast<double>(depth_.depth.size());
         std::snprintf(line, sizeof(line),
-                      "dense ts=%.3f src=t3dr dep=%dx%d feed=%dx%d valid=%.1f%% "
+                      "dense ts=%.3f src=t3dr dep=%dx%d feed=%dx%d valid=%.1f%% gate=%s "
                       "dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d dyn=%.1f%% "
                       "ms=%.0f fuse=%.1f upd=%.1f ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
                       "K=%.1f,%.1f,%.1f,%.1f q=%.3f,%.3f,%.3f,%.3f "
                       "seed=%d run=%d wskip=%d rel=%.2f ang=%.2f",
                       ts, frame.depthWidth, frame.depthHeight, feedW_, feedH_,
-                      total > 0 ? 100.0 * valid / total : 0.0,
+                      total > 0 ? 100.0 * valid / total : 0.0, gateText,
                       static_cast<double>(dmin), static_cast<double>(dmed),
                       static_cast<double>(dmax), tango_.triangleCount(),
                       tango_.segmentCount(), tango_.pendingSegments(), dynamicPct,
@@ -999,10 +1007,43 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
     // there, so farther samples only cost fusion time and import noise.
     const uint16_t maxMm = 6000;
     std::vector<float> src(count, 0.f);
+
+    // ARCore's raw depth is paired with a per-pixel confidence map. Values the
+    // sensor itself marks as unreliable are the flying pixels on silhouettes
+    // and the ramps it blended across a depth step; fusing them is what puts
+    // sheets in mid-air and bridges a small object to the surface behind it.
+    // The recommended threshold is half confidence (128).
+    const bool haveConfidence = frame.hasConfidence();
+    constexpr uint8_t kMinConfidence = 128;
+    int rawValid = 0;
+    int gatedValid = 0;
     for (size_t i = 0; i < count; ++i) {
         const uint16_t mm = frame.depthMm[i];
-        if (mm > 0 && mm <= maxMm) src[i] = static_cast<float>(mm) * 0.001f;
+        if (mm == 0 || mm > maxMm) continue;
+        ++rawValid;
+        if (haveConfidence && frame.confidence[i] < kMinConfidence) continue;
+        src[i] = static_cast<float>(mm) * 0.001f;
+        ++gatedValid;
     }
+
+    // On a device or scene where the confidence map rejects almost everything
+    // (a sunlit street, a low-texture wall) the honest choice is still to fuse
+    // the unfiltered map, not to stop reconstructing. The median pass below
+    // keeps single-pixel flyers out either way.
+    bool confidenceGate = haveConfidence;
+    const int gateFloor = static_cast<int>(static_cast<float>(count) * minValidFraction);
+    if (confidenceGate && gatedValid < gateFloor && rawValid >= gateFloor) {
+        confidenceGate = false;
+        std::fill(src.begin(), src.end(), 0.f);
+        for (size_t i = 0; i < count; ++i) {
+            const uint16_t mm = frame.depthMm[i];
+            if (mm > 0 && mm <= maxMm) src[i] = static_cast<float>(mm) * 0.001f;
+        }
+    }
+    lastConfidenceReject_.store(
+        confidenceGate && rawValid > 0
+            ? 100.f * static_cast<float>(rawValid - gatedValid) / static_cast<float>(rawValid)
+            : -1.f);
 
     depth.resize(dw, dh);
     int valid = 0;
@@ -1038,8 +1079,13 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
                     const float median = window[n / 2];
                     // A sample far from its neighbourhood is a flying pixel on
                     // a silhouette, not a surface; the TSDF would drag it into
-                    // a sheet between foreground and background.
-                    const float tol = std::max(0.04f, 0.05f * median);
+                    // a sheet between foreground and background. The tolerance
+                    // scales with range but is capped: at half a metre a flat
+                    // 4 cm window accepts the ramp ARCore smears between a
+                    // tabletop and a small object, which then fuses into a
+                    // membrane joining the two.
+                    const float tol =
+                        std::min(0.10f, std::max(0.025f, 0.035f * median));
                     if (std::fabs(centre - median) <= tol) value = median;
                 } else {
                     value = centre;
@@ -1051,8 +1097,13 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
                     hi = std::max(hi, window[i]);
                 }
                 // Only a one-pixel dropout on a continuous surface is filled;
-                // a gap at a depth step is a real hole in the observation.
-                if (hi - lo <= 0.08f) {
+                // a gap at a depth step is a real hole in the observation. The
+                // allowed step follows the range so a 5-6 cm object close to
+                // the phone is not mistaken for noise and bridged to the wall
+                // or table behind it.
+                const float fillTol =
+                    std::min(0.08f, std::max(0.02f, 0.03f * (0.5f * (lo + hi))));
+                if (hi - lo <= fillTol) {
                     std::sort(window, window + n);
                     value = window[n / 2];
                 }
@@ -1401,6 +1452,28 @@ int Engine::fuseDepth(const FrameInput& frame, const DepthResult& measured,
         }
     }
 
+    // The depth edge of a moving body is always contaminated by the background
+    // behind it. Leaving those pixels in the static feed glues a thin shell to
+    // the person; one pixel of dilation keeps the static volume clean and lets
+    // the dynamic surface cover the whole silhouette.
+    if (moving > 0) {
+        const std::vector<uint8_t> compact = mask;
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                if (!compact[static_cast<size_t>(y) * w + x]) continue;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const int yy = y + dy;
+                    if (yy < 0 || yy >= h) continue;
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int xx = x + dx;
+                        if (xx < 0 || xx >= w) continue;
+                        mask[static_cast<size_t>(yy) * w + xx] = 1;
+                    }
+                }
+            }
+        }
+    }
+
     prevDepthW_ = w;
     prevDepthH_ = h;
     prevKdepth_ = k;
@@ -1489,7 +1562,7 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
                         if (d <= 0.f) continue;
                         const int dl = lumaGrid_[j] > luma ? lumaGrid_[j] - luma
                                                            : luma - lumaGrid_[j];
-                        if (dl > 16) continue;
+                        if (dl > 12) continue;
                         donors[n++] = d;
                     }
                 }
@@ -1501,8 +1574,12 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
                     sum += donors[k];
                 }
                 // Donors on both sides of a depth step would average into a
-                // sheet; leave the pixel as a real hole instead.
-                if (hi - lo > std::max(0.06f, 0.06f * lo)) continue;
+                // sheet; leave the pixel as a real hole instead. The allowed
+                // step follows the range, so the 6 cm between a tabletop and a
+                // small object on it is a step, not an interpolation.
+                const float fillTol =
+                    std::min(0.06f, std::max(0.02f, 0.035f * lo));
+                if (hi - lo > fillTol) continue;
                 feedDepth_[i] = sum / static_cast<float>(n);
             }
         }
@@ -1520,7 +1597,7 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
             if (centre <= 0.f) continue;
             if (haveMask && motionMask_[i]) continue;
             const uint8_t luma = lumaGrid_[i];
-            const float scale = 0.012f + 0.012f * centre;
+            const float scale = 0.008f + 0.008f * centre;
             float sum = centre;
             float weightSum = 1.f;
             for (int dy = -1; dy <= 1; ++dy) {
@@ -1607,52 +1684,128 @@ void Engine::buildDynamicMesh(const FrameInput& frame, const DepthResult& depth,
     const int w = depth.w;
     const int h = depth.h;
     const Intrinsics& k = frame.Kdepth;
-    const Mat3 r = matFromQuat(frame.qx, frame.qy, frame.qz, frame.qw);
-    const Vec3 right = rotate(r, Vec3(1.f, 0.f, 0.f));
-    const Vec3 up = rotate(r, Vec3(0.f, 1.f, 0.f));
-    const Vec3 camera(frame.tx, frame.ty, frame.tz);
+    const size_t count = depth.depth.size();
 
-    if (w > 1 && h > 1 && k.fx > 1.f && k.fy > 1.f &&
-        mask.size() == depth.depth.size()) {
-        // A moving body is far sparser than the room; a few thousand camera-
-        // facing quads show it live without a second reconstruction volume.
-        constexpr int kMaxQuads = 4096;
-        mesh->vertices.reserve(static_cast<size_t>(kMaxQuads) * 4);
-        mesh->indices.reserve(static_cast<size_t>(kMaxQuads) * 6);
-        int quads = 0;
-        for (int v = 0; v < h && quads < kMaxQuads; ++v) {
-            for (int u = 0; u < w && quads < kMaxQuads; ++u) {
+    if (w > 2 && h > 2 && mask.size() == count && k.fx > 1.f && k.fy > 1.f) {
+        const Mat3 r = matFromQuat(frame.qx, frame.qy, frame.qz, frame.qw);
+        const Vec3 camera(frame.tx, frame.ty, frame.tz);
+        constexpr int kMaxVertices = 12000;
+
+        auto worldAt = [&](int u, int v, float z) {
+            const float xo = (static_cast<float>(u) - k.cx) * z / k.fx;
+            const float yo = (static_cast<float>(v) - k.cy) * z / k.fy;
+            return rotate(r, Vec3(xo, -yo, -z)) + camera;
+        };
+
+        // Shared vertices on the depth grid: the moving body becomes one
+        // connected surface instead of one quad per pixel, which is what made
+        // it look like scattered amber tickets.
+        std::vector<int> vertexIndex(count, -1);
+        mesh->vertices.reserve(4096);
+        for (int v = 0; v < h && static_cast<int>(mesh->vertices.size()) < kMaxVertices; ++v) {
+            for (int u = 0; u < w && static_cast<int>(mesh->vertices.size()) < kMaxVertices;
+                 ++u) {
                 const size_t idx = static_cast<size_t>(v) * w + u;
                 if (!mask[idx]) continue;
                 const float z = depth.depth[idx];
                 if (z <= 0.f) continue;
-                const float xo = (static_cast<float>(u) - k.cx) * z / k.fx;
-                const float yo = (static_cast<float>(v) - k.cy) * z / k.fy;
-                const Vec3 centre =
-                    rotate(r, Vec3(xo, -yo, -z)) + camera;
-                const float half = 0.75f * z / std::min(k.fx, k.fy);
-                const Vec3 normal = (camera - centre).normalized();
-                const Vec3 corners[4] = {
-                    centre - right * half - up * half,
-                    centre + right * half - up * half,
-                    centre + right * half + up * half,
-                    centre - right * half + up * half,
-                };
-                const uint32_t base = static_cast<uint32_t>(mesh->vertices.size());
-                for (const Vec3& p : corners) {
-                    MeshVertex vertex{};
-                    vertex.px = p.x; vertex.py = p.y; vertex.pz = p.z;
-                    vertex.nx = normal.x; vertex.ny = normal.y; vertex.nz = normal.z;
-                    vertex.r = 255; vertex.g = 168; vertex.b = 56; vertex.a = 255;
-                    mesh->vertices.push_back(vertex);
+                const Vec3 p = worldAt(u, v, z);
+                MeshVertex vertex{};
+                vertex.px = p.x;
+                vertex.py = p.y;
+                vertex.pz = p.z;
+                vertex.r = 255;
+                vertex.g = 168;
+                vertex.b = 56;
+                vertex.a = 255;
+                vertexIndex[idx] = static_cast<int>(mesh->vertices.size());
+                mesh->vertices.push_back(vertex);
+            }
+        }
+
+        auto sampleWorld = [&](int u, int v, Vec3& out) {
+            if (u < 0 || u >= w || v < 0 || v >= h) return false;
+            const float z = depth.depth[static_cast<size_t>(v) * w + u];
+            if (z <= 0.f) return false;
+            out = worldAt(u, v, z);
+            return true;
+        };
+
+        for (int v = 0; v < h; ++v) {
+            for (int u = 0; u < w; ++u) {
+                const size_t idx = static_cast<size_t>(v) * w + u;
+                const int vi = vertexIndex[idx];
+                if (vi < 0) continue;
+                const Vec3 centre(mesh->vertices[vi].px, mesh->vertices[vi].py,
+                                  mesh->vertices[vi].pz);
+
+                Vec3 left, right, up, down;
+                const bool hasLeft = sampleWorld(u - 1, v, left);
+                const bool hasRight = sampleWorld(u + 1, v, right);
+                const bool hasUp = sampleWorld(u, v - 1, up);
+                const bool hasDown = sampleWorld(u, v + 1, down);
+                if (!hasLeft && !hasRight) {
+                    right = centre + Vec3(1.f, 0.f, 0.f);
+                } else if (!hasLeft) {
+                    left = centre;
+                } else if (!hasRight) {
+                    right = centre;
                 }
-                mesh->indices.push_back(base + 0);
-                mesh->indices.push_back(base + 1);
-                mesh->indices.push_back(base + 2);
-                mesh->indices.push_back(base + 0);
-                mesh->indices.push_back(base + 2);
-                mesh->indices.push_back(base + 3);
-                ++quads;
+                if (!hasUp && !hasDown) {
+                    down = centre + Vec3(0.f, -1.f, 0.f);
+                } else if (!hasUp) {
+                    up = centre;
+                } else if (!hasDown) {
+                    down = centre;
+                }
+                // Tangent space from the two image axes, then orient the normal
+                // toward the camera so the amber surface is lit like the rest.
+                Vec3 normal = cross(right - left, down - up);
+                if (normal.length() < 1e-6f) {
+                    normal = (camera - centre).normalized();
+                } else {
+                    normal = normal.normalized();
+                    if (dot(normal, camera - centre) < 0.f) normal = normal * -1.f;
+                }
+                mesh->vertices[vi].nx = normal.x;
+                mesh->vertices[vi].ny = normal.y;
+                mesh->vertices[vi].nz = normal.z;
+            }
+        }
+
+        // Connect neighbours on the depth grid, but never across a real depth
+        // step: one edge of a walking person must not become a triangle that
+        // stretches to the wall behind them.
+        auto connectable = [&](int a, int b) {
+            const float za = depth.depth[static_cast<size_t>(a)];
+            const float zb = depth.depth[static_cast<size_t>(b)];
+            if (za <= 0.f || zb <= 0.f) return false;
+            const float step = std::fabs(za - zb);
+            return step <= std::max(0.03f, 0.06f * std::min(za, zb));
+        };
+
+        for (int v = 0; v < h; ++v) {
+            for (int u = 0; u < w; ++u) {
+                const size_t idx = static_cast<size_t>(v) * w + u;
+                const int a = vertexIndex[idx];
+                if (a < 0) continue;
+                if (u + 1 < w) {
+                    const size_t idxR = idx + 1;
+                    const int b = vertexIndex[idxR];
+                    if (b >= 0 && v + 1 < h) {
+                        const int d = vertexIndex[idx + w];
+                        const int c = vertexIndex[idx + w + 1];
+                        if (d >= 0 && c >= 0 && connectable(idx, idxR) &&
+                            connectable(idx, idx + w)) {
+                            mesh->indices.push_back(a);
+                            mesh->indices.push_back(c);
+                            mesh->indices.push_back(b);
+                            mesh->indices.push_back(a);
+                            mesh->indices.push_back(d);
+                            mesh->indices.push_back(c);
+                        }
+                    }
+                }
             }
         }
         mesh->triangleCount = static_cast<uint32_t>(mesh->indices.size() / 3);

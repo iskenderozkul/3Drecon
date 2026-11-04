@@ -91,7 +91,9 @@ private:
     // intrinsics and colour sampled through the measured CPU-image affine.
     void buildDepthKeyframe(const FrameInput& frame, Keyframe& kf) const;
     // Converts millimetres to metres and removes single-pixel flyers. Works at
-    // the native depth resolution, so no upsampling is involved.
+    // the native depth resolution, so no upsampling is involved. When ARCore
+    // supplies a raw-depth confidence image, pixels the sensor marks as
+    // unreliable are dropped before the median pass.
     bool prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
                           float minValidFraction = 0.125f);
     // Decides once per session whether the phone is in a room or on a street
@@ -259,6 +261,10 @@ private:
     // 3x3 flyer filter. Pixels dropped at silhouettes are holes in the
     // observation, so this is the number to watch when a surface is perforated.
     mutable std::atomic<float> hrDepthValid_{0.f};
+    // Share of depth samples the ARCore confidence gate dropped in the last
+    // grid; negative when the device supplies no confidence image. Logged so
+    // a gate that rejects almost everything is visible without the device.
+    mutable std::atomic<float> lastConfidenceReject_{-1.f};
 
     std::mutex diagMutex_;
     std::deque<std::string> diagLines_;

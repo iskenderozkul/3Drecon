@@ -34,6 +34,12 @@ struct FrameInput {
     // every frame, so a missing image is a transient failure to skip, not a
     // reason to substitute a different (weaker) depth source.
     bool depthApiActive = false;
+    // ARCore raw depth is paired with a confidence image (8-bit, same grid).
+    // Flying pixels on silhouettes and values smoothed across a depth step are
+    // exactly the low-confidence ones, so they are dropped before fusion.
+    std::vector<uint8_t> confidence;
+    int confidenceWidth = 0;
+    int confidenceHeight = 0;
     // CPU-image normalised (x,y) -> depth/texture normalised (u,v):
     // u = m[0]*x + m[1]*y + m[2], v = m[3]*x + m[4]*y + m[5].
     // ARCore crops its depth map to the display aspect ratio, so the depth map
@@ -48,6 +54,11 @@ struct FrameInput {
     bool hasDepth() const {
         return depthWidth > 1 && depthHeight > 1 &&
                static_cast<int>(depthMm.size()) == depthWidth * depthHeight;
+    }
+
+    bool hasConfidence() const {
+        return confidenceWidth == depthWidth && confidenceHeight == depthHeight &&
+               static_cast<int>(confidence.size()) == depthWidth * depthHeight;
     }
 
     bool valid() const {

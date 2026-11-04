@@ -498,7 +498,12 @@ void GLRenderer::render(const float* view, const float* projection, int cameraTe
 
     drawMesh(mesh, mode, vp.m, cameraPos);
     drawDynamicMesh(dynamicMesh, vp.m, cameraPos);
+    // Anchor markers are UI, not geometry: depth-testing them buries the ring
+    // inside the fused surface the anchor was placed on, so the user sees
+    // nothing where the anchor actually is.
+    glDisable(GL_DEPTH_TEST);
     drawAnchors(vp.m, anchorPositions, anchorCount);
+    glEnable(GL_DEPTH_TEST);
 
     glBindVertexArray(0);
     glUseProgram(0);

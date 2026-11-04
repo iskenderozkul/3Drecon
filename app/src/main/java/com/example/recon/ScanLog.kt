@@ -39,6 +39,7 @@ class ScanLog(private val context: Context) {
             file = target
             log("# Mobile 3D Scanner session")
             log("started=${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())}")
+            log("app_version=${appVersion()}")
             log("device=${Build.MANUFACTURER} ${Build.MODEL}")
             log("android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT}")
             log("abi=${Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}")
@@ -88,6 +89,49 @@ class ScanLog(private val context: Context) {
         return current
     }
 
+    /**
+     * Finalises the log when the activity leaves the foreground. The file is
+     * closed with a clean marker so it can be shared even if the process is
+     * killed afterwards; [resume] reopens the same file on return instead of
+     * starting a new one.
+     */
+    fun suspend(reason: String) {
+        val out = writer ?: return
+        try {
+            out.write("session_end=clean reason=$reason")
+            out.newLine()
+            out.flush()
+            out.close()
+        } catch (_: Exception) {
+        }
+        writer = null
+    }
+
+    fun resume(): Boolean {
+        if (writer != null) return true
+        val target = file
+        if (target == null || !target.exists()) return start() != null
+        return try {
+            writer = BufferedWriter(FileWriter(target, true))
+            log("session_resume=${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())}")
+            true
+        } catch (_: Exception) {
+            writer = null
+            false
+        }
+    }
+
+    private fun appVersion(): String = runCatching {
+        val info = context.packageManager.getPackageInfo(context.packageName, 0)
+        @Suppress("DEPRECATION")
+        val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            info.longVersionCode
+        } else {
+            info.versionCode.toLong()
+        }
+        "${info.versionName ?: "?"} ($code)"
+    }.getOrDefault("?")
+
     private fun prune(dir: File, keep: Int) {
         val logs = dir.listFiles { f ->
             f.isFile && f.name.startsWith("scan_") && f.name.endsWith(".txt")
@@ -100,6 +144,8 @@ class ScanLog(private val context: Context) {
 
     companion object {
 
+        private const val STALE_LOG_MS = 24L * 60L * 60L * 1000L
+
         fun logDirectory(context: Context): File =
             File(context.getExternalFilesDir(null) ?: context.filesDir, "logs")
 
@@ -109,12 +155,15 @@ class ScanLog(private val context: Context) {
         /**
          * Returns the newest session log that never reached its clean end, i.e.
          * the previous run died without shutting down. Null when the last run
-         * ended normally or there is no history yet.
+         * ended normally or there is no history yet. Logs older than a day are
+         * ignored so an old build's leftovers do not force safe mode.
          */
         fun findUncleanSession(context: Context): File? {
             val newest = logDirectory(context)
                 .listFiles { f -> f.isFile && f.name.startsWith("scan_") && f.name.endsWith(".txt") }
                 ?.maxByOrNull { it.lastModified() } ?: return null
+            val ageMs = System.currentTimeMillis() - newest.lastModified()
+            if (ageMs > STALE_LOG_MS) return null
             val tail = runCatching {
                 newest.bufferedReader().use { reader ->
                     val lines = reader.readLines()

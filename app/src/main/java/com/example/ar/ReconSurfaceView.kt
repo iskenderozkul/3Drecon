@@ -29,6 +29,7 @@ class ReconSurfaceView @JvmOverloads constructor(
 ) : GLSurfaceView(context, attrs) {
 
     var onError: ((String) -> Unit)? = null
+    var onAnchorFailure: ((String) -> Unit)? = null
 
     private val glRenderer = ReconGlRenderer()
     private var session: Session? = null
@@ -46,6 +47,7 @@ class ReconSurfaceView @JvmOverloads constructor(
         setRenderer(glRenderer)
         renderMode = RENDERMODE_CONTINUOUSLY
         glRenderer.onError = { message -> post { onError?.invoke(message) } }
+        glRenderer.onAnchorFailure = { message -> post { onAnchorFailure?.invoke(message) } }
     }
 
     fun onResumeSession() {
