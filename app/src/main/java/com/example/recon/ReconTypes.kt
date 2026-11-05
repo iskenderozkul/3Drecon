@@ -39,6 +39,11 @@ data class ReconMetrics(
     val blocks: Int = 0,
     // 0 = none yet, 1 = ARCore Depth API, 2 = native MVS fallback.
     val depthSource: Int = 0,
+    // Frames the worker has processed; a value that stops advancing while
+    // tracking is on identifies a stalled native stage together with [phase].
+    val framesProcessed: Int = 0,
+    // 0 idle, 1 prepare, 2 fuse, 3 feed, 4 integrate, 5 mesh, 6 remesh.
+    val phase: Int = 0,
     val tracking: Boolean = false,
     val scanning: Boolean = false,
     val depthPreview: Bitmap? = null,

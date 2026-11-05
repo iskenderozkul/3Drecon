@@ -179,6 +179,8 @@ class ReconSurfaceView @JvmOverloads constructor(
             keyframes = ints[0],
             blocks = ints[3],
             depthSource = ints[5],
+            framesProcessed = ints[4],
+            phase = ints[6],
             tracking = glRenderer.tracking,
             scanning = scanning,
             depthPreview = depthBitmap,

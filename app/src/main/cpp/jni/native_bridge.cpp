@@ -243,11 +243,12 @@ void nativeGetStats(JNIEnv* env, jobject, jlong handle, jfloatArray floatsArr,
         const jfloat values[2] = {engine.processMs(), engine.fps()};
         env->SetFloatArrayRegion(floatsArr, 0, 2, values);
     }
-    if (intsArr && env->GetArrayLength(intsArr) >= 6) {
-        const jint values[6] = {engine.keyframeCount(), engine.triangleCount(),
+    if (intsArr && env->GetArrayLength(intsArr) >= 7) {
+        const jint values[7] = {engine.keyframeCount(), engine.triangleCount(),
                                 engine.vertexCount(), engine.blockCount(),
-                                engine.framesProcessed(), engine.depthSource()};
-        env->SetIntArrayRegion(intsArr, 0, 6, values);
+                                engine.framesProcessed(), engine.depthSource(),
+                                engine.phase()};
+        env->SetIntArrayRegion(intsArr, 0, 7, values);
     }
 }
 

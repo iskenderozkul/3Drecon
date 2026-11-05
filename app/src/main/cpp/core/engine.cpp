@@ -199,6 +199,7 @@ void Engine::workerLoop() {
             fpsWindowFrames = 0;
         }
         if (doRemesh) {
+            phase_.store(6);
             const float start = nowSeconds();
             if (tangoActive_.load()) {
                 tango_.publish(true);
@@ -260,10 +261,15 @@ void Engine::workerLoop() {
             }
             remeshCv_.notify_all();
         }
-        if (doReset || doRemesh) continue;
+        if (doReset || doRemesh) {
+            phase_.store(0);
+            continue;
+        }
 
         const float start = nowSeconds();
+        phase_.store(1);
         const bool processed = processFrame(frame);
+        phase_.store(0);
         if (processed) {
             const float elapsedMs = (nowSeconds() - start) * 1000.f;
             const float prev = processMs_.load();
@@ -300,9 +306,7 @@ void Engine::performReset() {
     sceneMedianSum_ = 0.f;
     sceneLumaSum_ = 0.f;
     lastSpeed_ = 0.f;
-    feedScale_ = 1;
-    updateMsEma_ = 0.f;
-    feedQuietFrames_ = 0;
+    phase_.store(0);
     fusedDepth_.clear();
     fusedVar_.clear();
     fusedAge_.clear();
@@ -596,6 +600,7 @@ std::string Engine::drainDiagnostics() {
 }
 
 bool Engine::processDepthFrame(const FrameInput& frame) {
+    phase_.store(1);
     const float start = nowSeconds();
     const double ts = static_cast<double>(frame.timestampNs) * 1e-9;
 
@@ -639,6 +644,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     // pixels to keep integrating; the old 12.5 % gate made meshing start only
     // after the user walked back inside.
     const bool depthUsable = prepareDepthGrid(frame, depth_, 0.04f);
+    phase_.store(2);
     // Classify even from frames that are too sparse to fuse: a sunlit street
     // often sits right at the validity gate, and the scene statistics still
     // carry enough signal to choose the right cleaning rules. Only vote when
@@ -666,7 +672,9 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     const float fuseMs =
         static_cast<float>((nowSecondsPrecise() - fuseStart) * 1000.0);
     buildFusionFeed(frame);
+    phase_.store(5);
     buildDynamicMesh(frame, depth_, motionMask_);
+    phase_.store(4);
 
     TangoRecon::DepthFeed feed;
     feed.mm = &feedDepthMm_;
@@ -706,28 +714,12 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     }
 
     // The reconstruction cost scales with the number of depth rays and the
-    // cell count it can touch. When it dominates the frame, halve the grid
-    // handed to it: the fused surface is already smoothed and hole-filled, so
-    // the half-resolution copy carries nearly the same geometry for a quarter
-    // of the work. Hysteresis keeps it from flapping between the two.
-    const float upd = static_cast<float>(tango_.lastUpdateMs());
-    updateMsEma_ = updateMsEma_ > 0.f ? updateMsEma_ * 0.8f + upd * 0.2f : upd;
-    if (feedScale_ == 1 && updateMsEma_ > 70.f) {
-        feedScale_ = 2;
-        feedQuietFrames_ = 0;
-        pushDiag("feed=half_depth");
-    } else if (feedScale_ == 2) {
-        if (updateMsEma_ < 20.f) {
-            if (++feedQuietFrames_ >= 150) {
-                feedScale_ = 1;
-                feedQuietFrames_ = 0;
-                pushDiag("feed=full_depth");
-            }
-        } else {
-            feedQuietFrames_ = 0;
-        }
-    }
-
+    // cell count it can touch. An earlier build halved the feed to 80x45 when
+    // update time climbed above 70 ms; the Tango core is initialised with one
+    // depth resolution and died on the first frame after that switch (all
+    // session logs stop right after `feed=half_depth`). It now always gets
+    // the native 160x90 grid, so fusion stays at 60-120 ms instead of ~10 ms
+    // but the scan no longer crashes.
     tangoActive_.store(true);
     depthSource_.store(1);
     ++nextKeyframeId_;
@@ -1622,58 +1614,17 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
         }
     }
 
-    const int s = feedScale_ == 2 && (w % 2) == 0 && (h % 2) == 0 ? 2 : 1;
-    feedScale_ = s;
-    feedW_ = w / s;
-    feedH_ = h / s;
+    feedW_ = w;
+    feedH_ = h;
     feedDepthMm_.assign(static_cast<size_t>(feedW_) * feedH_, 0);
 
-    auto toMm = [](float d) {
-        return static_cast<uint16_t>(std::min(65535.f, std::round(d * 1000.f)));
-    };
-
-    if (s == 1) {
-        for (size_t i = 0; i < count; ++i) {
-            if (haveMask && motionMask_[i]) continue;
-            const float d = feedDepth_[i];
-            if (d > 0.f) feedDepthMm_[i] = toMm(d);
-        }
-    } else {
-        for (int y = 0; y < feedH_; ++y) {
-            for (int x = 0; x < feedW_; ++x) {
-                float lo = 0.f, hi = 0.f, sum = 0.f;
-                int n = 0;
-                for (int dy = 0; dy < 2; ++dy) {
-                    for (int dx = 0; dx < 2; ++dx) {
-                        const size_t p = static_cast<size_t>(y * 2 + dy) * w + (x * 2 + dx);
-                        if (haveMask && motionMask_[p]) continue;
-                        const float d = feedDepth_[p];
-                        if (d <= 0.f) continue;
-                        if (n == 0) {
-                            lo = hi = d;
-                        } else {
-                            lo = std::min(lo, d);
-                            hi = std::max(hi, d);
-                        }
-                        sum += d;
-                        ++n;
-                    }
-                }
-                if (n == 0) continue;
-                // A block that straddles a depth step takes the foreground
-                // surface; averaging would round the silhouette away.
-                const float value = hi - lo > 0.12f ? lo : sum / static_cast<float>(n);
-                feedDepthMm_[static_cast<size_t>(y) * feedW_ + x] = toMm(value);
-            }
-        }
+    for (size_t i = 0; i < count; ++i) {
+        if (haveMask && motionMask_[i]) continue;
+        const float d = feedDepth_[i];
+        if (d > 0.f) feedDepthMm_[i] = static_cast<uint16_t>(std::min(65535.f, std::round(d * 1000.f)));
     }
 
     feedK_ = fusionK_;
-    const float inv = 1.f / static_cast<float>(s);
-    feedK_.fx = fusionK_.fx * inv;
-    feedK_.fy = fusionK_.fy * inv;
-    feedK_.cx = (fusionK_.cx + 0.5f * static_cast<float>(s - 1)) * inv;
-    feedK_.cy = (fusionK_.cy + 0.5f * static_cast<float>(s - 1)) * inv;
     feedK_.width = feedW_;
     feedK_.height = feedH_;
 }

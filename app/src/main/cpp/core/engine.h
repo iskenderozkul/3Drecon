@@ -72,6 +72,10 @@ public:
     int vertexCount() const;
     // 0 = none yet, 1 = ARCore Depth API, 2 = on-device MVS fallback.
     int depthSource() const { return depthSource_.load(); }
+    // Stage the worker is in right now. A frozen scan leaves this at the phase
+    // that never finished, which is the only clue available without logcat.
+    // 0 idle, 1 prepare, 2 fuse, 3 feed, 4 integrate, 5 mesh, 6 remesh.
+    int phase() const { return phase_.load(); }
     // One line per processed keyframe, drained by the diagnostics log.
     std::string drainDiagnostics();
 
@@ -179,15 +183,14 @@ private:
     Intrinsics fusionK_;
     // Smoothed copy handed to the reconstruction (metres).
     std::vector<float> feedDepth_;
-    // Millimetre grid actually handed to the reconstruction; feedScale_ 2 means
-    // the engine halved it because depth fusion dominated the frame.
+    // Millimetre grid handed to the reconstruction. The Tango core is
+    // initialised with one depth resolution and does not survive a mid-session
+    // switch to another one, so this is always the native 160x90 grid.
     std::vector<uint16_t> feedDepthMm_;
     Intrinsics feedK_;
     int feedW_ = 0;
     int feedH_ = 0;
-    int feedScale_ = 1;
-    float updateMsEma_ = 0.f;
-    int feedQuietFrames_ = 0;
+    std::atomic<int> phase_{0};
     std::vector<uint8_t> motionMask_;
     int prevDepthW_ = 0;
     int prevDepthH_ = 0;

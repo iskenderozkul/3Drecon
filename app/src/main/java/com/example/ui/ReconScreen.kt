@@ -38,10 +38,19 @@ import com.example.ui.theme.RoseError
 import com.example.ui.theme.TextSecondary
 import kotlinx.coroutines.delay
 
+private fun phaseName(phase: Int): String = when (phase) {
+    1 -> "prepare"
+    2 -> "fuse"
+    3 -> "feed"
+    4 -> "integrate"
+    5 -> "mesh"
+    6 -> "remesh"
+    else -> "idle"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ReconScreen(scanLog: ScanLog) {
-    val context = LocalContext.current
+fun ReconScreen(scanLog: ScanLog) {    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val surfaceView = remember(context) { ReconSurfaceView(context) }
@@ -81,6 +90,8 @@ fun ReconScreen(scanLog: ScanLog) {
     }
 
     LaunchedEffect(surfaceView) {
+        var lastFrameCount = -1
+        var lastProgressAt = System.currentTimeMillis()
         while (true) {
             metrics = surfaceView.snapshotMetrics()
             anchors = surfaceView.anchors()
@@ -88,8 +99,23 @@ fun ReconScreen(scanLog: ScanLog) {
                 "t fps=${"%.1f".format(metrics.fps)} ms=${"%.0f".format(metrics.processMs)} " +
                     "kf=${metrics.keyframes} tris=${metrics.triangles} " +
                     "blocks=${metrics.blocks} src=${metrics.depthSource} " +
+                    "frames=${metrics.framesProcessed} phase=${phaseName(metrics.phase)} " +
                     "tracking=${metrics.tracking} scanning=${metrics.scanning}"
             )
+            // A frozen worker used to look like a crash: frames stop advancing
+            // while the UI keeps running. Name the stage explicitly so the
+            // session log shows where the native side is stuck.
+            if (metrics.framesProcessed != lastFrameCount) {
+                lastFrameCount = metrics.framesProcessed
+                lastProgressAt = System.currentTimeMillis()
+            } else if (metrics.tracking && metrics.scanning &&
+                System.currentTimeMillis() - lastProgressAt > 6000
+            ) {
+                scanLog.log(
+                    "stall frames=${metrics.framesProcessed} phase=${phaseName(metrics.phase)}"
+                )
+                lastProgressAt = System.currentTimeMillis()
+            }
             scanLog.logBlock(surfaceView.drainDiagnostics())
             delay(500)
         }

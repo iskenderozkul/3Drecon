@@ -111,7 +111,7 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
 
     fun snapshotMetrics(): Pair<FloatArray, IntArray> {
         val floats = FloatArray(2)
-        val ints = IntArray(6)
+        val ints = IntArray(7)
         val handle = nativeHandle
         if (handle != 0L) NativeRecon.getStats(handle, floats, ints)
         return floats to ints
