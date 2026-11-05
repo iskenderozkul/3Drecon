@@ -5,7 +5,12 @@
 >
 > Android 8.0+ · ARCore (Google Play Services for AR) gerekli.
 >
-> **Sürüm v2.2** (versionCode 4) — APK içinde ve oturum logunun başında da yazar.
+> **Sürüm v2.3** (versionCode 5) — APK içinde ve oturum logunun başında da yazar.
+> v2.3: the scene vote is re-evaluated (outdoor rules no longer stay off after starting
+> indoors), depth reaches 7 m outdoors, the confidence gate relaxes in steps instead of
+> switching off, far-range smoothing follows sensor noise, and the mesh queue is fair
+> (oldest-first slots, no full flush). v2.2 remains available as
+> `dist/3Drecon-best-v2.2.apk`.
 
 Real-time dense 3D reconstruction on a phone: ARCore provides live 6DoF tracking,
 camera frames and intrinsics; Google's Apache-2.0 **Tango 3D Reconstruction** core
@@ -64,16 +69,22 @@ stretched quads. It is amber and clears as soon as the residual goes away.
 
 ### Room or street, chosen automatically
 
-There is still no mode switch. For the first ~20 depth frames the engine measures
-where the sky is: outdoors the top quarter of the depth map is mostly empty (the sky
-returns no depth), the median surface is metres away and a large share of samples sits
-past 4.5 m; a room has a ceiling and nearby walls. Mean image brightness is the last vote,
-because pointing the phone down at sunlit pavement hides both the sky and the distance.
-The signal now only changes the **cleaning rules** — far-sample trimming, isolated
-speckle removal on asphalt, residual tolerance — because rebuilding the volume when the
-decision flipped erased everything captured so far. The volumetric profile is fixed at
-**3 cm voxels with a 6 m range**: ARCore extrapolates beyond that and the extra distance
-only added noise and fusion cost. `Reset` clears the decision.
+There is still no mode switch. The engine continuously votes on the scene from the depth
+map: outdoors the top quarter is mostly empty (the sky returns no depth), the median
+surface is metres away and a large share of samples sits past 4.5 m; a room has a ceiling
+and nearby walls. Mean image brightness is the last vote, because pointing the phone down
+at sunlit pavement hides both the sky and the distance. The vote is an exponential average
+of every usable frame and is re-checked every 2 s; entering the street rules needs two
+consecutive votes and leaving them needs three, so a lit doorway does not flip the rules
+mid-room. v2.3 fixed the part that never worked: the decision used to be taken once from
+the first 20 frames, so a scan that started indoors stayed "indoor" after the user walked
+outside and none of the street handling ever engaged.
+
+The signal changes the **cleaning rules** — far-sample trimming, isolated speckle removal
+on asphalt, residual tolerance — and the depth range: 6 m indoors, 7 m on the street, where
+cutting everything at 6 m collapsed the far side of the road onto the near facade. The
+volumetric profile stays fixed (3 cm voxels, 8 m ceiling) because rebuilding the volume
+when the decision flipped erased everything captured so far. `Reset` clears the decision.
 
 The display is kept awake for as long as the activity is in front (`FLAG_KEEP_SCREEN_ON`),
 because a scan has no touch input and the system timeout used to turn the screen — and the
@@ -96,9 +107,13 @@ blend between the measurement and the previous fused surface warped into the cur
 - The reconstruction never sees unchecked depth: raw depth is used when available and a
   pixel is rejected when ARCore's confidence image is below 128, which drops the
   low-confidence flying pixels that ARCore produces while it smooths across a depth step.
-  If the gate would remove too much of the frame (a textureless wall), it backs off for
-  that frame instead of handing the fusion an empty map. The share of rejected pixels
-  appears as `gate=` in the dense log line.
+  v2.3 made the gate a ladder instead of all-or-nothing: when the 128 threshold would keep
+  less than the usable share of the frame (on the test device it rejects ~90 % of a room),
+  the threshold steps to 96 and then 64, and only a frame with nothing above 64 falls back
+  to the unfiltered map. The old code dropped straight to unfiltered, so the sparsest
+  scenes — exactly where holes and stray shards appeared — got the least filtering. The
+  dense log line shows the rejection share as `gate=` and the threshold actually used as
+  `cthr=`.
 - Cleaning tolerances scale with distance and are capped (median 2.5–10 cm, single-pixel
   fill 2–6 cm), so a ~6 cm object on a table is no longer bridged into a membrane by an
   absolute centimetre threshold meant for walls.
@@ -113,7 +128,10 @@ blend between the measurement and the previous fused surface warped into the cur
   consistent depth, so a doorway or a rim is not bridged. This is where the colour image
   completes what the depth sensor could not measure.
 - One light edge-preserving smooth runs on the copy handed to the reconstruction. It does
-  not touch the filter state, so repeated smoothing cannot slowly melt detail away.
+  not touch the filter state, so repeated smoothing cannot slowly melt detail away. Its
+  tolerance follows the sensor's range-dependent noise (σ = 7 mm + 0.45 %·z²): unchanged
+  below ~3.5 m, wider on the 4–6 m part of a wall, which is where the unfiltered jitter was
+  being triangulated into ripples.
 
 This is the part that removes the lumpy, "melted" ground seen on grazing pavement: the
 sensor's per-frame noise is averaged in time before marching cubes ever triangulates it.
@@ -140,7 +158,9 @@ engine diagnostics twice per second while the scanner runs. The newest 12 logs a
 longer required to obtain it. Each half-second line carries `frames=` and `phase=`
 (1 prepare, 2 fuse, 3 feed, 4 integrate, 5 mesh, 6 remesh); when frames stop advancing
 while tracking is on, a `stall frames=… phase=…` line is written so a freeze names the
-native stage that never finished.
+native stage that never finished. The dense line also splits the frame cost into
+`prep=`, `fuse=`, `feed=`, `dynms=`, `upd=` and `ex=` (milliseconds), so the next
+optimisation can be aimed at whichever stage actually dominates instead of guessing.
 
 The log is closed with `session_end=clean` in `onStop`, i.e. when the app leaves the
 foreground, and the same file is reopened with `session_resume=` when it returns. Swiping
@@ -167,7 +187,7 @@ diagnosable from the shared file alone.
 | Stage | Where | What actually happens |
 |---|---|---|
 | Tracking & frames | `ar/ReconGlRenderer.kt`, `core/frame.h` | ARCore `Session` at `LATEST_CAMERA_IMAGE`; every tracked frame delivers the YUV_420_888 CPU image (de-strided in JNI), the camera pose quaternion/translation and pinhole intrinsics (scaled to the image size). When the device supports the ARCore Depth API (`Config.DepthMode.AUTOMATIC`), the matching depth and confidence images are delivered too (raw depth preferred, smooth depth as a fallback). Consecutive frames are checked for pose continuity: an apparent speed above 2.5 m/s means ARCore relocalised, so that frame and the next three are not fused. Anchors are placed on real geometry: the screen centre is hit-tested with `Frame.hitTest`, a tracked plane hit is preferred and a depth point second; an arbitrary feature-point hit is rejected because it carries no metric depth. If neither exists, the anchor uses the depth measured under the crosshair (median of a 15×15 patch, 0.25–7.5 m). If that is unknown too, no anchor is created and a short notice asks the user to aim at a surface — the old fixed 1.2 m guess is what put markers in mid-air. Plane finding runs in `HORIZONTAL_AND_VERTICAL` mode, and markers are drawn with depth testing disabled so the ring is visible on top of the surface it is attached to. |
-| Reconstruction core (primary) | `tango/tango_recon.cpp`, `tango/tango_recon.h` | Google Tango 3D Reconstruction (Apache 2.0, the same core used by 3DLiveScanner) loaded through `dlopen`. Every held frame is fused with `Tango3DR_updateFromDepthImage`: the raw 16-bit millimetre DEPTH16 map is passed at its native 160×90 together with the ARCore camera pose converted from the OpenGL frame (Y up, −Z forward) to Tango's optical camera frame (Y down, +Z forward) by a 180° rotation about the camera X axis — the same conversion 3DLiveScanner applies. Without it every map fuses mirrored behind the camera. Depth-grid intrinsics are derived from ARCore's texture intrinsics. The colour image is the full 640×480 YUV frame converted to NV21 and paired with its own pinhole intrinsics, so vertex colours are sampled with the correct calibration. Config: **3 cm voxels with a 6 m range**, projective update, space clearing, parallel integration, debris components under 9 vertices removed. It is fed the temporally fused, hole-filled grid (see above) at the native 160×90. An earlier build halved the feed to 80×45 when update time climbed above 70 ms; the Tango core is initialised with one depth resolution and the process died on the first frame after that switch — every session log stopped immediately after `feed=half_depth`. The halving path is gone, so fusion costs 60–120 ms per frame but the scan stays up. Tango does its own visibility clearing and marching cubes; we only cache the 16³ grid segments it reports as changed and publish the concatenated mesh as an immutable snapshot. Extract order and cadence are what make the surface appear quickly: every segment the update reports is pushed into a nearest-first priority queue (deduplicated by grid key), and each frame spends at most a 30 ms slice extracting it, so the surface in front of the camera materialises first while fusion keeps its frame budget. Remaining segments publish every 0.15 s; a backlog above **768** segments is dropped and re-enters the queue the next time the depth frame touches it, so a fast sweep cannot build a multi-second lag between what the user aims at and what is on screen (the previous 4096 cap let the queue climb to 1400–3100 cells and the visible mesh fell behind the volume). Extracted cells are validated before they are copied: a null buffer, an implausible vertex/face count or an out-of-range face index is rejected instead of dereferenced, and the cached display copy is capped at **1500 cells / 1 000 000 vertices**, dropping the cells farthest from the current camera first, so a long outdoor walk cannot grow the published mesh without bound (the core volume keeps its state). The exporter refuses a full-volume extraction above 3 000 000 vertices / 5 000 000 faces rather than doubling peak memory. If the library cannot be loaded, the engine logs `t3dr=unavailable fallback=legacy` and uses the self-written TSDF path below. |
+| Reconstruction core (primary) | `tango/tango_recon.cpp`, `tango/tango_recon.h` | Google Tango 3D Reconstruction (Apache 2.0, the same core used by 3DLiveScanner) loaded through `dlopen`. Every held frame is fused with `Tango3DR_updateFromDepthImage`: the raw 16-bit millimetre DEPTH16 map is passed at its native 160×90 together with the ARCore camera pose converted from the OpenGL frame (Y up, −Z forward) to Tango's optical camera frame (Y down, +Z forward) by a 180° rotation about the camera X axis — the same conversion 3DLiveScanner applies. Without it every map fuses mirrored behind the camera. Depth-grid intrinsics are derived from ARCore's texture intrinsics. The colour image is the full 640×480 YUV frame converted to NV21 and paired with its own pinhole intrinsics, so vertex colours are sampled with the correct calibration. Config: **3 cm voxels, 8 m range ceiling**, projective update, space clearing, parallel integration, debris components under 9 vertices removed. It is fed the temporally fused, hole-filled grid (see above) at the native 160×90; the engine itself caps depth at 6 m indoors and 7 m on the street. An earlier build halved the feed to 80×45 when update time climbed above 70 ms; the Tango core is initialised with one depth resolution and the process died on the first frame after that switch — every session log stopped immediately after `feed=half_depth`. The halving path is gone, so fusion costs 60–120 ms per frame but the scan stays up. Tango does its own visibility clearing and marching cubes; we only cache the 16³ grid segments it reports as changed and publish the concatenated mesh as an immutable snapshot. Extract order and cadence are what make the surface appear quickly: every segment the update reports is pushed into a nearest-first priority queue (deduplicated by grid key) and the same key is appended to an insertion-order queue; each frame spends at most a 30 ms slice extracting it (44 ms when the backlog is large and fusion is fast, so it can drain), and every fourth slot is served **oldest-first** instead of nearest-first. Nearest-first alone starved everything behind the camera, which is why parts of a room could stay unmeshed no matter how long the scan ran, while v2.3's old policy dropped the entire 768-cell backlog when it overflowed — including the cells around the user. The cap is now **1536** and only the farthest quarter is discarded, so the recent backlog survives. Remaining segments publish every 0.2 s. Extracted cells are validated before they are copied: a null buffer, an implausible vertex/face count or an out-of-range face index is rejected instead of dereferenced, and the cached display copy is capped at **1500 cells / 1 000 000 vertices**, dropping the cells farthest from the current camera first, so a long outdoor walk cannot grow the published mesh without bound (the core volume keeps its state). The exporter refuses a full-volume extraction above 3 000 000 vertices / 5 000 000 faces rather than doubling peak memory. If the library cannot be loaded, the engine logs `t3dr=unavailable fallback=legacy` and uses the self-written TSDF path below. |
 | Keyframes | `core/keyframe_manager.cpp` | **MVS path only** — the ARCore-depth path integrates every frame and does not gate on keyframes. Sliding reference window of 14 keyframes plus a lifetime counter. A new keyframe is taken at most every 0.25 s and only once the baseline exceeds 15 cm or the view rotates by 8°; near-duplicate viewpoints cost 50–300 ms of fusion each without adding information. Reference selection follows Mobile3DRecon Eqs. (1)–(3): `wb = exp(−(b−0.6)²/0.2²)` around a 0.6 m baseline and `wv = max(10°/α, 1)`; the top two references are kept and weighted `S/ΣS` in the cost (Eq. 7). References beyond 75° are rejected as uninformative. |
 | Depth input | `mvs/census.cpp`, `mvs/stereo.cpp`, `core/engine.cpp` | **Primary: ARCore Depth API.** On the Tango path the *cleaned* copy is fused: the same map that drives previews and statistics is handed to the reconstruction core, so median-rejected flyers and moving pixels never enter the static volume. `prepareDepthGrid` converts millimetres to metres (0.05–6 m), runs a 3×3 median, rejects a centre sample that departs from its neighbourhood by more than max(4 cm, 5 % of depth) as a flying pixel on a silhouette, and fills a single-pixel dropout only when at least six neighbours agree within 8 cm. A frame with under 4 % valid depth is skipped — indoors the map is usually dense, and the old 12.5 % gate delayed meshing until the user walked back inside. Samples past 6 m are dropped for every scene (ARCore depth is unreliable at that range and the reconstruction stops there anyway), and when the scene is classified as a street isolated pixels without two valid neighbours are also removed, because sunlight and glossy asphalt return single-pixel speckles that the 3×3 median cannot see. A depth image that trails the camera by more than 400 ms — or by more than 20 cm at the current walking speed — is not fused against the current pose. The depth map is aligned to the camera texture, not the 4:3 CPU image, so unprojection uses ARCore's texture intrinsics scaled to the depth resolution and colour is sampled through the measured image-region affine — exactly what Google's raw-depth sample does. **Fallback when the device has no depth support:** half-resolution (320×240) 64-bit Census (8×8 minus centre, NEON `VCNT` Hamming), weighted multi-view cost over 96 inverse-depth planes in [0.3 m, 3.0 m], epipolar projection `K1 R1ᵀ R0 K0⁻¹`, 8-path SGM with gradient-adaptive `P2 = 40 + 0.45·|∇I|`, parabolic sub-pixel refinement, then a continuous ±1-plane photometric search with bilinear luma sampling. The match is kept only if the reference keyframe's own depth agrees (forward-backward check); confidence combines the photometric cost-valley sharpness with the 5×5 sub-level label disagreement `ω` (Eqs. 13–14) and drops `M < 0.15`. Results under 5 % valid pixels are discarded. |
 | Refinement | `mvs/refine.cpp` | 3×3 median outlier removal + 5×5 joint bilateral filter guided by luminance, so planes flatten while silhouette edges stay sharp (MVS path only; ARCore depth is already filtered). |

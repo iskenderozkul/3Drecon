@@ -100,11 +100,11 @@ private:
     // unreliable are dropped before the median pass.
     bool prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
                           float minValidFraction = 0.125f);
-    // Decides once per session whether the phone is in a room or on a street
-    // (sky under the top quarter, far surfaces, median range, brightness) and
-    // uses it for the depth cleaning rules. No user-facing setting.
-    void sampleScene(const DepthResult& depth, float meanLuma);
-    // Per-pixel temporal fusion. The previous fused surface is warped into the
+    // Votes on the current scene from every usable depth frame (sky under the
+    // top quarter, far surfaces, median range, brightness) and switches the
+    // room/street rules when the vote is consistent for a moment. No
+    // user-facing setting.
+    void sampleScene(const DepthResult& depth, float meanLuma);    // Per-pixel temporal fusion. The previous fused surface is warped into the
     // current camera and blended with the measurement through a Kalman step:
     // standing still averages many frames into one smooth surface, and the
     // process noise grows with camera motion so walking follows the sensor.
@@ -152,20 +152,27 @@ private:
     bool tangoReady_ = false;
     int tangoFailStreak_ = 0;
 
-    // Room vs street, decided automatically from the first ~20 depth frames.
-    // In a street most of the top quarter is sky (no depth return), the median
-    // surface is far away and a large share of samples sits past 4.5 m; a room
-    // has a ceiling, nearby walls and a much shorter median. The signal only
-    // changes how aggressively sparse samples are rejected: the volumetric
-    // profile is fixed, because recreating the reconstruction mid-scan wiped
-    // everything the user had captured when the decision flipped.
+    // Room vs street, re-evaluated every couple of seconds instead of once per
+    // session. In a street most of the top quarter is sky (no depth return),
+    // the median surface is far away and a large share of samples sits past
+    // 4.5 m; a room has a ceiling, nearby walls and a much shorter median.
+    // The signal changes how aggressively sparse samples are rejected and how
+    // far depth is still accepted. It used to be decided once from the first
+    // 20 frames, so a scan that started indoors stayed "indoor" after the user
+    // walked outside and the street rules never engaged. The volumetric
+    // profile stays fixed: recreating the reconstruction mid-scan wiped
+    // everything captured so far.
     bool outdoor_ = false;
+    bool sceneHasStats_ = false;
     bool sceneDecided_ = false;
     int sceneSamples_ = 0;
-    float sceneSkySum_ = 0.f;
-    float sceneFarSum_ = 0.f;
-    float sceneMedianSum_ = 0.f;
-    float sceneLumaSum_ = 0.f;
+    int sceneOutdoorStreak_ = 0;
+    int sceneIndoorStreak_ = 0;
+    double lastSceneEvalSeconds_ = 0.0;
+    float sceneSkyEma_ = 0.f;
+    float sceneFarEma_ = 0.f;
+    float sceneMedianEma_ = 0.f;
+    float sceneLumaEma_ = 0.f;
     // Camera speed from the last accepted frame, used to reject depth maps
     // whose lag would place them more than a few centimetres away.
     float lastSpeed_ = 0.f;
@@ -268,6 +275,11 @@ private:
     // grid; negative when the device supplies no confidence image. Logged so
     // a gate that rejects almost everything is visible without the device.
     mutable std::atomic<float> lastConfidenceReject_{-1.f};
+    // Confidence threshold the last grid actually used (128/96/64, 0 = the
+    // gate was relaxed all the way). Logged with the rejection share because a
+    // threshold that had to drop to 64 explains both a livelier mesh and more
+    // speckle in the same session.
+    mutable std::atomic<int> lastConfidenceThreshold_{0};
 
     std::mutex diagMutex_;
     std::deque<std::string> diagLines_;

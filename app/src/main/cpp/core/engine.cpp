@@ -293,18 +293,23 @@ void Engine::performReset() {
     mesher_.reset();
     // A reset is also how the user moves between a room and the street; the
     // volumetric profile is fixed (reset() re-initialises it) and the scene
-    // statistics only choose how sparse samples are cleaned.
+    // vote only chooses how sparse samples are cleaned and how far depth is
+    // accepted.
     tango_.reset();
     tangoReady_ = tango_.ready();
     tangoActive_.store(false);
     tangoFailStreak_ = 0;
     outdoor_ = false;
+    sceneHasStats_ = false;
     sceneDecided_ = false;
     sceneSamples_ = 0;
-    sceneSkySum_ = 0.f;
-    sceneFarSum_ = 0.f;
-    sceneMedianSum_ = 0.f;
-    sceneLumaSum_ = 0.f;
+    sceneOutdoorStreak_ = 0;
+    sceneIndoorStreak_ = 0;
+    lastSceneEvalSeconds_ = 0.0;
+    sceneSkyEma_ = 0.f;
+    sceneFarEma_ = 0.f;
+    sceneMedianEma_ = 0.f;
+    sceneLumaEma_ = 0.f;
     lastSpeed_ = 0.f;
     phase_.store(0);
     fusedDepth_.clear();
@@ -612,15 +617,18 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     if (!tangoReady_) return processLegacyDepthFrame(frame);
 
     // A depth map that trails the camera by most of a second would be fused at
-    // the wrong pose. Walking outdoors the lag matters much sooner: even a few
-    // centimetres of displacement between the depth capture and the pose turns
-    // one map into a ghost sheet, so the threshold is tight and also scales
-    // with how fast the phone is moving.
+    // the wrong pose. The real error is how far the phone travelled while the
+    // map was being produced, so the check uses displacement first and keeps a
+    // hard one-second ceiling for the case where speed is unknown.
     double depthLagMs = std::numeric_limits<double>::quiet_NaN();
     if (frame.depthTimestampNs > 0) {
         depthLagMs = static_cast<double>(frame.timestampNs - frame.depthTimestampNs) * 1e-6;
+        // Displacement is what actually misplaces the map; a slow walk with a
+        // 700 ms lag covers only a few centimetres, and skipping those frames
+        // was leaving holes exactly where the user was sweeping. Only a map
+        // from a previous second is dropped regardless of motion.
         const double displacement = std::max(0.0, depthLagMs) * 0.001 * lastSpeed_;
-        if (depthLagMs > 400.0 || displacement > 0.20) {
+        if (depthLagMs > 900.0 || displacement > 0.18) {
             if (start - lastDiagSeconds_ >= 1.f) {
                 lastDiagSeconds_ = start;
                 char line[192];
@@ -643,7 +651,9 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     // Outdoors the depth map is sparse, so the dense path only needs 4 % valid
     // pixels to keep integrating; the old 12.5 % gate made meshing start only
     // after the user walked back inside.
+    const double prepStart = nowSecondsPrecise();
     const bool depthUsable = prepareDepthGrid(frame, depth_, 0.04f);
+    const float prepMs = static_cast<float>((nowSecondsPrecise() - prepStart) * 1000.0);
     phase_.store(2);
     // Classify even from frames that are too sparse to fuse: a sunlit street
     // often sits right at the validity gate, and the scene statistics still
@@ -671,9 +681,13 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     const int movingPixels = fuseDepth(frame, depth_, motionMask_);
     const float fuseMs =
         static_cast<float>((nowSecondsPrecise() - fuseStart) * 1000.0);
+    const double feedStart = nowSecondsPrecise();
     buildFusionFeed(frame);
+    const float feedMs = static_cast<float>((nowSecondsPrecise() - feedStart) * 1000.0);
     phase_.store(5);
+    const double dynStart = nowSecondsPrecise();
     buildDynamicMesh(frame, depth_, motionMask_);
+    const float dynMs = static_cast<float>((nowSecondsPrecise() - dynStart) * 1000.0);
     phase_.store(4);
 
     TangoRecon::DepthFeed feed;
@@ -783,16 +797,20 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(depth_.depth.size());
         std::snprintf(line, sizeof(line),
                       "dense ts=%.3f src=t3dr dep=%dx%d feed=%dx%d valid=%.1f%% gate=%s "
-                      "dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d dyn=%.1f%% "
-                      "ms=%.0f fuse=%.1f upd=%.1f ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
+                      "cthr=%d dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d "
+                      "dyn=%.1f%% ms=%.0f prep=%.1f fuse=%.1f feed=%.1f dynms=%.1f "
+                      "upd=%.1f ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
                       "K=%.1f,%.1f,%.1f,%.1f q=%.3f,%.3f,%.3f,%.3f "
                       "seed=%d run=%d wskip=%d rel=%.2f ang=%.2f",
                       ts, frame.depthWidth, frame.depthHeight, feedW_, feedH_,
                       total > 0 ? 100.0 * valid / total : 0.0, gateText,
+                      lastConfidenceThreshold_.load(),
                       static_cast<double>(dmin), static_cast<double>(dmed),
                       static_cast<double>(dmax), tango_.triangleCount(),
                       tango_.segmentCount(), tango_.pendingSegments(), dynamicPct,
-                      static_cast<double>(processMs_.load()), static_cast<double>(fuseMs),
+                      static_cast<double>(processMs_.load()), static_cast<double>(prepMs),
+                      static_cast<double>(fuseMs), static_cast<double>(feedMs),
+                      static_cast<double>(dynMs),
                       tango_.lastUpdateMs(), tango_.lastExtractMs(),
                       static_cast<double>(frame.tx),
                       static_cast<double>(frame.ty), static_cast<double>(frame.tz),
@@ -995,45 +1013,58 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
     const size_t count = static_cast<size_t>(dw) * dh;
     if (frame.depthMm.size() != count) return false;
 
-    // ARCore extrapolates beyond ~6 m and the reconstruction's own range ends
-    // there, so farther samples only cost fusion time and import noise.
-    const uint16_t maxMm = 6000;
+    // ARCore extrapolates beyond ~6 m indoors and the reconstruction's own
+    // range ends there, so farther samples only cost fusion time and import
+    // noise. A street needs the extra metre: without it everything past the
+    // near facade collapses onto the 6 m plane and the far side of the road
+    // never appears.
+    const uint16_t maxMm = outdoor_ ? 7000 : 6000;
     std::vector<float> src(count, 0.f);
 
     // ARCore's raw depth is paired with a per-pixel confidence map. Values the
     // sensor itself marks as unreliable are the flying pixels on silhouettes
     // and the ramps it blended across a depth step; fusing them is what puts
     // sheets in mid-air and bridges a small object to the surface behind it.
-    // The recommended threshold is half confidence (128).
+    //
+    // Confidence is a ranking, not a boolean. On this device the recommended
+    // 128 threshold keeps only ~5 % of an indoor frame, and the old code then
+    // dropped the gate entirely the moment that fell below the usable floor,
+    // so the sparsest scenes got the least filtered pixels. Relaxing one step
+    // at a time keeps the strictest threshold that still yields a usable grid;
+    // only a sensor with nothing above 64 falls back to the ungated map.
     const bool haveConfidence = frame.hasConfidence();
-    constexpr uint8_t kMinConfidence = 128;
+    const int gateFloor = static_cast<int>(static_cast<float>(count) * minValidFraction);
     int rawValid = 0;
+    uint8_t usedThreshold = 0;
+    if (haveConfidence) {
+        for (size_t i = 0; i < count; ++i) {
+            const uint16_t mm = frame.depthMm[i];
+            if (mm > 0 && mm <= maxMm) ++rawValid;
+        }
+        for (const int threshold : {128, 96, 64}) {
+            int kept = 0;
+            for (size_t i = 0; i < count; ++i) {
+                const uint16_t mm = frame.depthMm[i];
+                if (mm > 0 && mm <= maxMm && frame.confidence[i] >= threshold) ++kept;
+            }
+            if (kept >= gateFloor) {
+                usedThreshold = static_cast<uint8_t>(threshold);
+                break;
+            }
+        }
+    }
     int gatedValid = 0;
     for (size_t i = 0; i < count; ++i) {
         const uint16_t mm = frame.depthMm[i];
         if (mm == 0 || mm > maxMm) continue;
-        ++rawValid;
-        if (haveConfidence && frame.confidence[i] < kMinConfidence) continue;
+        if (usedThreshold > 0 && frame.confidence[i] < usedThreshold) continue;
         src[i] = static_cast<float>(mm) * 0.001f;
         ++gatedValid;
     }
 
-    // On a device or scene where the confidence map rejects almost everything
-    // (a sunlit street, a low-texture wall) the honest choice is still to fuse
-    // the unfiltered map, not to stop reconstructing. The median pass below
-    // keeps single-pixel flyers out either way.
-    bool confidenceGate = haveConfidence;
-    const int gateFloor = static_cast<int>(static_cast<float>(count) * minValidFraction);
-    if (confidenceGate && gatedValid < gateFloor && rawValid >= gateFloor) {
-        confidenceGate = false;
-        std::fill(src.begin(), src.end(), 0.f);
-        for (size_t i = 0; i < count; ++i) {
-            const uint16_t mm = frame.depthMm[i];
-            if (mm > 0 && mm <= maxMm) src[i] = static_cast<float>(mm) * 0.001f;
-        }
-    }
+    lastConfidenceThreshold_.store(static_cast<int>(usedThreshold));
     lastConfidenceReject_.store(
-        confidenceGate && rawValid > 0
+        usedThreshold > 0 && rawValid > 0
             ? 100.f * static_cast<float>(rawValid - gatedValid) / static_cast<float>(rawValid)
             : -1.f);
 
@@ -1160,7 +1191,6 @@ float Engine::meanLuma(const FrameInput& frame) const {
 }
 
 void Engine::sampleScene(const DepthResult& depth, float luma) {
-    if (sceneDecided_) return;
     const int w = depth.w;
     const int h = depth.h;
     if (w <= 2 || h <= 2) return;
@@ -1188,38 +1218,73 @@ void Engine::sampleScene(const DepthResult& depth, float luma) {
     // A frame with almost no usable depth (direct sunlight) carries no
     // information about the scene; counting it would bias every average.
     if (valid < 60) return;
-    float median = 0.f;
     const size_t mid = samples.size() / 2;
     std::nth_element(samples.begin(), samples.begin() + mid, samples.end());
-    median = samples[mid];
+    const float median = samples[mid];
 
-    sceneSkySum_ += skyTotal > 0
-                        ? static_cast<float>(skyInvalid) / static_cast<float>(skyTotal)
-                        : 0.f;
-    sceneFarSum_ += static_cast<float>(far) / static_cast<float>(valid);
-    sceneMedianSum_ += median;
-    sceneLumaSum_ += luma;
-    if (++sceneSamples_ < 20) return;
+    const float sky = skyTotal > 0
+                          ? static_cast<float>(skyInvalid) / static_cast<float>(skyTotal)
+                          : 0.f;
+    const float farFraction = static_cast<float>(far) / static_cast<float>(valid);
+    // Exponential average: one lit doorway or one dark corner must not flip
+    // the rules, while a walk from a room out to the street has to register in
+    // a couple of seconds. The old code voted once after 20 frames and never
+    // again, so a session that started indoors stayed "indoor" on the street.
+    constexpr float kAlpha = 0.18f;
+    if (!sceneHasStats_) {
+        sceneHasStats_ = true;
+        sceneSkyEma_ = sky;
+        sceneFarEma_ = farFraction;
+        sceneMedianEma_ = median;
+        sceneLumaEma_ = luma;
+    } else {
+        sceneSkyEma_ += kAlpha * (sky - sceneSkyEma_);
+        sceneFarEma_ += kAlpha * (farFraction - sceneFarEma_);
+        sceneMedianEma_ += kAlpha * (median - sceneMedianEma_);
+        sceneLumaEma_ += kAlpha * (luma - sceneLumaEma_);
+    }
+    ++sceneSamples_;
 
-    sceneDecided_ = true;
-    const float sky = sceneSkySum_ / static_cast<float>(sceneSamples_);
-    const float farFraction = sceneFarSum_ / static_cast<float>(sceneSamples_);
-    const float medianDepth = sceneMedianSum_ / static_cast<float>(sceneSamples_);
-    const float meanBrightness = sceneLumaSum_ / static_cast<float>(sceneSamples_);
+    const double now = nowSeconds();
+    if (sceneSamples_ < 6) return;
+    if (sceneDecided_ && now - lastSceneEvalSeconds_ < 2.0) return;
+    lastSceneEvalSeconds_ = now;
+
     // Sky + distant surfaces is a street; a large median alone also counts
     // (an open yard without visible sky in the crop). Sunlit pavement pointed
     // straight down has neither, so brightness is the last vote: outdoors the
     // camera exposes the scene several stops brighter than a room.
-    outdoor_ = (sky > 0.5f && farFraction > 0.10f) || farFraction > 0.30f ||
-               medianDepth > 3.0f ||
-               (meanBrightness > 145.f && farFraction > 0.02f && medianDepth > 1.4f);
-    char line[224];
-    std::snprintf(line, sizeof(line),
-                  "scene=%s sky=%.2f far=%.2f med=%.2f luma=%.0f frames=%d",
-                  outdoor_ ? "outdoor" : "indoor", static_cast<double>(sky),
-                  static_cast<double>(farFraction), static_cast<double>(medianDepth),
-                  static_cast<double>(meanBrightness), sceneSamples_);
-    pushDiag(line);
+    const bool vote =
+        (sceneSkyEma_ > 0.5f && sceneFarEma_ > 0.10f) || sceneFarEma_ > 0.30f ||
+        sceneMedianEma_ > 3.0f ||
+        (sceneLumaEma_ > 145.f && sceneFarEma_ > 0.02f && sceneMedianEma_ > 1.4f);
+    if (vote) {
+        ++sceneOutdoorStreak_;
+        sceneIndoorStreak_ = 0;
+    } else {
+        ++sceneIndoorStreak_;
+        sceneOutdoorStreak_ = 0;
+    }
+
+    // Entering the street rules takes two consecutive votes (~4 s), leaving
+    // them takes three (~6 s). The vote only changes cleaning strength and the
+    // depth range, never the volume, so a moment of misclassification costs a
+    // little detail rather than the scan.
+    bool next = outdoor_;
+    if (!outdoor_ && sceneOutdoorStreak_ >= 2) next = true;
+    if (outdoor_ && sceneIndoorStreak_ >= 3) next = false;
+
+    if (!sceneDecided_ || next != outdoor_) {
+        sceneDecided_ = true;
+        outdoor_ = next;
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "scene=%s sky=%.2f far=%.2f med=%.2f luma=%.0f frames=%d",
+                      outdoor_ ? "outdoor" : "indoor", static_cast<double>(sceneSkyEma_),
+                      static_cast<double>(sceneFarEma_), static_cast<double>(sceneMedianEma_),
+                      static_cast<double>(sceneLumaEma_), sceneSamples_);
+        pushDiag(line);
+    }
 }
 
 int Engine::fuseDepth(const FrameInput& frame, const DepthResult& measured,
@@ -1589,7 +1654,14 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
             if (centre <= 0.f) continue;
             if (haveMask && motionMask_[i]) continue;
             const uint8_t luma = lumaGrid_[i];
-            const float scale = 0.008f + 0.008f * centre;
+            // The sigma has to follow the sensor's own noise, which grows with
+            // the square of range (ARCore stereo error). A fixed 2-5 cm band
+            // left the 4-6 m part of a wall with the full jitter of each
+            // depth map, and the TSDF triangulated it into ripples; indoors
+            // this stays identical, outdoors it tightens the far surface
+            // without touching anything closer than ~3.5 m.
+            const float noiseSigma = 0.007f + 0.0045f * centre * centre;
+            const float scale = std::max(0.008f + 0.008f * centre, 0.8f * noiseSigma);
             float sum = centre;
             float weightSum = 1.f;
             for (int dy = -1; dy <= 1; ++dy) {

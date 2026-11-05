@@ -170,8 +170,9 @@ bool TangoRecon::init(double resolution, double maxDepth) {
     }
     // 3 cm voxels keep leaves, mug rims and chair edges; the grid is fed by a
     // 160x90 metric depth map whose footprint is 1-2 cm at room range. The
-    // 6 m range matches what ARCore still resolves: farther samples are
-    // extrapolation, and integrating them only added noise and fusion cost.
+    // range ceiling sits at 8 m so the street path can feed the 7 m it
+    // measures; indoors the engine still stops at 6 m, where ARCore's depth
+    // starts extrapolating.
     a.configSetDouble(config, "resolution", resolution_);
     a.configSetDouble(config, "min_depth", 0.20);
     a.configSetDouble(config, "max_depth", maxDepth_);
@@ -209,6 +210,7 @@ void TangoRecon::applyProfile(double resolution, double maxDepth) {
     segmentVertices_ = 0;
     std::priority_queue<SegmentTask, std::vector<SegmentTask>, SegmentTaskGreater> empty;
     pending_.swap(empty);
+    pendingFifo_.clear();
     pendingSet_.clear();
     pendingCount_.store(0);
     dirty_ = false;
@@ -238,6 +240,7 @@ void TangoRecon::reset() {
     segmentVertices_ = 0;
     std::priority_queue<SegmentTask, std::vector<SegmentTask>, SegmentTaskGreater> empty;
     pending_.swap(empty);
+    pendingFifo_.clear();
     pendingSet_.clear();
     pendingCount_.store(0);
     dirty_ = false;
@@ -358,15 +361,31 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
     }
 
     // A fast sweep over a large room can enqueue more segments than the frame
-    // budget can ever drain; a stale backlog would then delay the surface the
-    // user is actually aiming at. The cap is kept small enough that the queue
-    // never grows into a multi-second lag: a dropped cell re-enters the queue
-    // the next time the depth frame touches it.
-    constexpr size_t kMaxPending = 768;
+    // budget can ever drain. The old cap cleared the whole queue, so a region
+    // the user had just swept could lose every pending cell and stay unmeshed
+    // until they happened to aim at it again. Now only the farthest quarter is
+    // dropped; the cells around the camera and the recent backlog survive.
+    constexpr size_t kMaxPending = 1536;
     if (pending_.size() > kMaxPending) {
-        pending_ = std::priority_queue<SegmentTask, std::vector<SegmentTask>,
-                                       SegmentTaskGreater>();
+        std::vector<SegmentTask> keep;
+        keep.reserve(pending_.size());
+        while (!pending_.empty()) {
+            keep.push_back(pending_.top());
+            pending_.pop();
+        }
+        constexpr size_t kKeep = 1200;
+        std::nth_element(keep.begin(), keep.begin() + kKeep, keep.end(),
+                         [](const SegmentTask& a, const SegmentTask& b) {
+                             return a.distance2 < b.distance2;
+                         });
+        keep.resize(kKeep);
         pendingSet_.clear();
+        pendingFifo_.clear();
+        for (const SegmentTask& t : keep) {
+            pendingSet_.insert(gridKey(t.index));
+            pending_.push(t);
+            pendingFifo_.push_back(t.index);
+        }
     }
 
     for (uint32_t i = 0; i < updated.num_indices; ++i) {
@@ -384,22 +403,56 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
         const float dy = cy - frame.ty;
         const float dz = cz - frame.tz;
         pending_.push(SegmentTask{key, dx * dx + dy * dy + dz * dz});
+        pendingFifo_.push_back(key);
     }
     a.gridDestroy(&updated);
     pendingCount_.store(static_cast<int>(pending_.size()));
 
+    // Most FIFO entries are spent the moment the heap serves their cell in the
+    // same frame, so the queue is compacted before it can grow without bound.
+    if (pendingFifo_.size() > 2048) {
+        std::deque<std::array<int, 3>> live;
+        for (const std::array<int, 3>& key : pendingFifo_) {
+            if (pendingSet_.count(gridKey(key)) > 0) live.push_back(key);
+        }
+        pendingFifo_.swap(live);
+    }
+
     // Meshing must never stall depth fusion: spend a bounded slice of the
     // frame and let the rest of the queue wait for the next one. At 10-15 Hz
     // a 30 ms slice keeps the surface in front of the camera growing while
-    // leaving the worker enough budget to accept the next depth map.
-    constexpr double kExtractBudgetMs = 30.0;
+    // leaving the worker enough budget to accept the next depth map. One slot
+    // in four is served oldest-first so cells the user already passed stop
+    // waiting forever.
+    const double kExtractBudgetMs =
+        (pending_.size() > 400 && lastUpdateMs_.load() < 60.0) ? 44.0 : 30.0;
     const double extractStart = nowSeconds();
     bool extracted = false;
+    int slots = 0;
     while (!pending_.empty()) {
         if ((nowSeconds() - extractStart) * 1000.0 >= kExtractBudgetMs) break;
+        ++slots;
+        bool tookOldest = false;
+        std::array<int, 3> oldest{};
+        if ((slots % 4) == 0 && pendingFifo_.size() > 64) {
+            for (int tries = 0; tries < 32 && !pendingFifo_.empty(); ++tries) {
+                const std::array<int, 3> key = pendingFifo_.front();
+                pendingFifo_.pop_front();
+                if (pendingSet_.erase(gridKey(key)) == 0) continue;
+                oldest = key;
+                tookOldest = true;
+                break;
+            }
+        }
+        if (tookOldest) {
+            extractSegment(oldest);
+            extracted = true;
+            continue;
+        }
         const SegmentTask task = pending_.top();
         pending_.pop();
-        pendingSet_.erase(gridKey(task.index));
+        // The same cell can still sit in the heap after the FIFO served it.
+        if (pendingSet_.erase(gridKey(task.index)) == 0) continue;
         extractSegment(task.index);
         extracted = true;
     }
@@ -582,9 +635,11 @@ bool TangoRecon::publishLocked() {
 
 void TangoRecon::publish(bool force) {
     if (!dirty_ && !force) return;
-    // A 0.15 s cadence is one publish per frame or two at 10-15 Hz: the mesh
-    // grows visibly while the copies stay cheap.
-    if (!force && nowSeconds() - lastPublishSeconds_ < 0.15) return;
+    // 0.2 s is one publish every second or third fused frame: the mesh still
+    // grows visibly while the whole cached surface is not re-copied more often
+    // than the worker can afford (the copy is up to 1 M vertices by the end of
+    // a long scan, and it sits in the same thread that fuses depth).
+    if (!force && nowSeconds() - lastPublishSeconds_ < 0.20) return;
     publishLocked();
 }
 

@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -35,7 +36,9 @@ public:
     TangoRecon(const TangoRecon&) = delete;
     TangoRecon& operator=(const TangoRecon&) = delete;
 
-    bool init(double resolution = 0.03, double maxDepth = 6.0);
+    // maxDepth is only a ceiling: integration cost follows the measured depth
+    // actually fed in, and the engine feeds 6 m indoors and 7 m outdoors.
+    bool init(double resolution = 0.03, double maxDepth = 8.0);
     // Rebuilds the volume with another profile. Kept for callers that need a
     // different grid; the engine no longer switches mid-scan because that
     // wiped everything captured so far.
@@ -45,8 +48,8 @@ public:
     void reset();
 
     // One depth grid handed to the reconstruction. The engine feeds its
-    // temporally fused grid, and may halve it when fusion dominates the frame;
-    // the intrinsics travel with it so the projection stays exact.
+    // temporally fused grid at the native resolution and passes the matching
+    // intrinsics so the projection stays exact.
     struct DepthFeed {
         const std::vector<uint16_t>* mm = nullptr;
         int width = 0;
@@ -112,6 +115,11 @@ private:
     size_t segmentVertices_ = 0;
     float lastCamera_[3] = {0.f, 0.f, 0.f};
     std::priority_queue<SegmentTask, std::vector<SegmentTask>, SegmentTaskGreater> pending_;
+    // Insertion order of the same cells. Nearest-first serves what the user is
+    // aiming at, but on its own it starves everything behind the camera, which
+    // is why parts of a room could stay unmeshed no matter how long the scan
+    // ran. Every fourth extraction comes from this end instead.
+    std::deque<std::array<int, 3>> pendingFifo_;
     std::unordered_set<uint64_t> pendingSet_;
     bool dirty_ = false;
     double lastPublishSeconds_ = 0.0;
