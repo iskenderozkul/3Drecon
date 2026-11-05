@@ -170,9 +170,8 @@ bool TangoRecon::init(double resolution, double maxDepth) {
     }
     // 3 cm voxels keep leaves, mug rims and chair edges; the grid is fed by a
     // 160x90 metric depth map whose footprint is 1-2 cm at room range. The
-    // range ceiling sits at 8 m so the street path can feed the 7 m it
-    // measures; indoors the engine still stops at 6 m, where ARCore's depth
-    // starts extrapolating.
+    // ceiling matches the engine's feed cap: past 6 m ARCore extrapolates and
+    // the extra volume only stores noise.
     a.configSetDouble(config, "resolution", resolution_);
     a.configSetDouble(config, "min_depth", 0.20);
     a.configSetDouble(config, "max_depth", maxDepth_);
@@ -424,8 +423,7 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
     // leaving the worker enough budget to accept the next depth map. One slot
     // in four is served oldest-first so cells the user already passed stop
     // waiting forever.
-    const double kExtractBudgetMs =
-        (pending_.size() > 400 && lastUpdateMs_.load() < 60.0) ? 44.0 : 30.0;
+    constexpr double kExtractBudgetMs = 30.0;
     const double extractStart = nowSeconds();
     bool extracted = false;
     int slots = 0;

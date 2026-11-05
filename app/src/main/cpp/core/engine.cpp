@@ -617,18 +617,19 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
     if (!tangoReady_) return processLegacyDepthFrame(frame);
 
     // A depth map that trails the camera by most of a second would be fused at
-    // the wrong pose. The real error is how far the phone travelled while the
-    // map was being produced, so the check uses displacement first and keeps a
-    // hard one-second ceiling for the case where speed is unknown.
+    // the wrong pose. Walking outdoors the lag matters much sooner: even a few
+    // centimetres of displacement between the depth capture and the pose turns
+    // one map into a ghost sheet, so the threshold is tight and also scales
+    // with how fast the phone is moving.
     double depthLagMs = std::numeric_limits<double>::quiet_NaN();
     if (frame.depthTimestampNs > 0) {
         depthLagMs = static_cast<double>(frame.timestampNs - frame.depthTimestampNs) * 1e-6;
-        // Displacement is what actually misplaces the map; a slow walk with a
-        // 700 ms lag covers only a few centimetres, and skipping those frames
-        // was leaving holes exactly where the user was sweeping. Only a map
-        // from a previous second is dropped regardless of motion.
+        // Displacement alone misses rotation: turning the phone moves no more
+        // than a few centimetres while the whole view sweeps, and a 700 ms old
+        // map fused at the new pose is exactly the sheet seen in v2.3. Keep
+        // the tight wall-clock ceiling.
         const double displacement = std::max(0.0, depthLagMs) * 0.001 * lastSpeed_;
-        if (depthLagMs > 900.0 || displacement > 0.18) {
+        if (depthLagMs > 400.0 || displacement > 0.20) {
             if (start - lastDiagSeconds_ >= 1.f) {
                 lastDiagSeconds_ = start;
                 char line[192];
@@ -1013,58 +1014,48 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
     const size_t count = static_cast<size_t>(dw) * dh;
     if (frame.depthMm.size() != count) return false;
 
-    // ARCore extrapolates beyond ~6 m indoors and the reconstruction's own
-    // range ends there, so farther samples only cost fusion time and import
-    // noise. A street needs the extra metre: without it everything past the
-    // near facade collapses onto the 6 m plane and the far side of the road
-    // never appears.
-    const uint16_t maxMm = outdoor_ ? 7000 : 6000;
+    // ARCore extrapolates beyond ~6 m and the reconstruction's own range ends
+    // there, so farther samples only cost fusion time and import noise.
+    constexpr uint16_t maxMm = 6000;
     std::vector<float> src(count, 0.f);
 
     // ARCore's raw depth is paired with a per-pixel confidence map. Values the
     // sensor itself marks as unreliable are the flying pixels on silhouettes
     // and the ramps it blended across a depth step; fusing them is what puts
     // sheets in mid-air and bridges a small object to the surface behind it.
-    //
-    // Confidence is a ranking, not a boolean. On this device the recommended
-    // 128 threshold keeps only ~5 % of an indoor frame, and the old code then
-    // dropped the gate entirely the moment that fell below the usable floor,
-    // so the sparsest scenes got the least filtered pixels. Relaxing one step
-    // at a time keeps the strictest threshold that still yields a usable grid;
-    // only a sensor with nothing above 64 falls back to the ungated map.
-    const bool haveConfidence = frame.hasConfidence();
+    // The gate is kept strict and all-or-nothing: relaxing it step by step let
+    // low-confidence ramps through on sparse frames and the result was lumpy
+    // surfaces, which is worse than a partially observed frame.
+    constexpr uint8_t kMinConfidence = 128;
+    const bool confidenceGate = frame.hasConfidence();
     const int gateFloor = static_cast<int>(static_cast<float>(count) * minValidFraction);
     int rawValid = 0;
-    uint8_t usedThreshold = 0;
-    if (haveConfidence) {
-        for (size_t i = 0; i < count; ++i) {
-            const uint16_t mm = frame.depthMm[i];
-            if (mm > 0 && mm <= maxMm) ++rawValid;
-        }
-        for (const int threshold : {128, 96, 64}) {
-            int kept = 0;
-            for (size_t i = 0; i < count; ++i) {
-                const uint16_t mm = frame.depthMm[i];
-                if (mm > 0 && mm <= maxMm && frame.confidence[i] >= threshold) ++kept;
-            }
-            if (kept >= gateFloor) {
-                usedThreshold = static_cast<uint8_t>(threshold);
-                break;
-            }
-        }
-    }
     int gatedValid = 0;
     for (size_t i = 0; i < count; ++i) {
         const uint16_t mm = frame.depthMm[i];
         if (mm == 0 || mm > maxMm) continue;
-        if (usedThreshold > 0 && frame.confidence[i] < usedThreshold) continue;
+        ++rawValid;
+        if (confidenceGate && frame.confidence[i] < kMinConfidence) continue;
         src[i] = static_cast<float>(mm) * 0.001f;
         ++gatedValid;
     }
 
-    lastConfidenceThreshold_.store(static_cast<int>(usedThreshold));
+    if (confidenceGate && gatedValid < gateFloor && rawValid >= gateFloor) {
+        // Too few confident pixels to build a surface. Using the unfiltered map
+        // for this frame is better than dropping it, but the strict gate stays
+        // in force for the next one.
+        gatedValid = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const uint16_t mm = frame.depthMm[i];
+            if (mm == 0 || mm > maxMm) continue;
+            src[i] = static_cast<float>(mm) * 0.001f;
+            ++gatedValid;
+        }
+    }
+
+    lastConfidenceThreshold_.store(confidenceGate ? kMinConfidence : 0);
     lastConfidenceReject_.store(
-        usedThreshold > 0 && rawValid > 0
+        confidenceGate && rawValid > 0
             ? 100.f * static_cast<float>(rawValid - gatedValid) / static_cast<float>(rawValid)
             : -1.f);
 
@@ -1246,7 +1237,10 @@ void Engine::sampleScene(const DepthResult& depth, float luma) {
     ++sceneSamples_;
 
     const double now = nowSeconds();
-    if (sceneSamples_ < 6) return;
+    // Warm up over the first 20 frames like the stable build, so the average
+    // is not dominated by whatever the camera happened to face at launch. The
+    // difference from v2.2 is only that the vote keeps running afterwards.
+    if (sceneSamples_ < 20) return;
     if (sceneDecided_ && now - lastSceneEvalSeconds_ < 2.0) return;
     lastSceneEvalSeconds_ = now;
 
@@ -1266,12 +1260,12 @@ void Engine::sampleScene(const DepthResult& depth, float luma) {
         sceneOutdoorStreak_ = 0;
     }
 
-    // Entering the street rules takes two consecutive votes (~4 s), leaving
-    // them takes three (~6 s). The vote only changes cleaning strength and the
-    // depth range, never the volume, so a moment of misclassification costs a
-    // little detail rather than the scan.
+    // Entering the street rules takes four consecutive votes (~8 s), leaving
+    // them takes three (~6 s). The vote only changes cleaning strength, never
+    // the volume, but a long room (>3 m median) can look like a street, so the
+    // stricter entry keeps a hallway from switching profiles mid-scan.
     bool next = outdoor_;
-    if (!outdoor_ && sceneOutdoorStreak_ >= 2) next = true;
+    if (!outdoor_ && sceneOutdoorStreak_ >= 4) next = true;
     if (outdoor_ && sceneIndoorStreak_ >= 3) next = false;
 
     if (!sceneDecided_ || next != outdoor_) {
@@ -1654,14 +1648,10 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
             if (centre <= 0.f) continue;
             if (haveMask && motionMask_[i]) continue;
             const uint8_t luma = lumaGrid_[i];
-            // The sigma has to follow the sensor's own noise, which grows with
-            // the square of range (ARCore stereo error). A fixed 2-5 cm band
-            // left the 4-6 m part of a wall with the full jitter of each
-            // depth map, and the TSDF triangulated it into ripples; indoors
-            // this stays identical, outdoors it tightens the far surface
-            // without touching anything closer than ~3.5 m.
-            const float noiseSigma = 0.007f + 0.0045f * centre * centre;
-            const float scale = std::max(0.008f + 0.008f * centre, 0.8f * noiseSigma);
+            // The band widens with range but stays on the curve that produced
+            // the stable geometry: a wider band smoothed across real depth
+            // steps and turned flat surfaces lumpy (v2.3).
+            const float scale = 0.008f + 0.008f * centre;
             float sum = centre;
             float weightSum = 1.f;
             for (int dy = -1; dy <= 1; ++dy) {

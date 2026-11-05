@@ -104,7 +104,8 @@ private:
     // top quarter, far surfaces, median range, brightness) and switches the
     // room/street rules when the vote is consistent for a moment. No
     // user-facing setting.
-    void sampleScene(const DepthResult& depth, float meanLuma);    // Per-pixel temporal fusion. The previous fused surface is warped into the
+    void sampleScene(const DepthResult& depth, float meanLuma);
+    // Per-pixel temporal fusion. The previous fused surface is warped into the
     // current camera and blended with the measurement through a Kalman step:
     // standing still averages many frames into one smooth surface, and the
     // process noise grows with camera motion so walking follows the sensor.
@@ -152,16 +153,15 @@ private:
     bool tangoReady_ = false;
     int tangoFailStreak_ = 0;
 
-    // Room vs street, re-evaluated every couple of seconds instead of once per
-    // session. In a street most of the top quarter is sky (no depth return),
+    // Room vs street, re-evaluated every couple of seconds after a 20-frame
+    // warm-up. In a street most of the top quarter is sky (no depth return),
     // the median surface is far away and a large share of samples sits past
     // 4.5 m; a room has a ceiling, nearby walls and a much shorter median.
-    // The signal changes how aggressively sparse samples are rejected and how
-    // far depth is still accepted. It used to be decided once from the first
-    // 20 frames, so a scan that started indoors stayed "indoor" after the user
-    // walked outside and the street rules never engaged. The volumetric
-    // profile stays fixed: recreating the reconstruction mid-scan wiped
-    // everything captured so far.
+    // The signal changes how aggressively sparse samples are rejected. It used
+    // to be decided once from the first 20 frames, so a scan that started
+    // indoors stayed "indoor" after the user walked outside and the street
+    // rules never engaged. The volumetric profile stays fixed: recreating the
+    // reconstruction mid-scan wiped everything captured so far.
     bool outdoor_ = false;
     bool sceneHasStats_ = false;
     bool sceneDecided_ = false;
@@ -275,10 +275,9 @@ private:
     // grid; negative when the device supplies no confidence image. Logged so
     // a gate that rejects almost everything is visible without the device.
     mutable std::atomic<float> lastConfidenceReject_{-1.f};
-    // Confidence threshold the last grid actually used (128/96/64, 0 = the
-    // gate was relaxed all the way). Logged with the rejection share because a
-    // threshold that had to drop to 64 explains both a livelier mesh and more
-    // speckle in the same session.
+    // Confidence threshold the last grid actually used (128, or 0 when the
+    // device supplied no confidence image). Logged next to the rejection share
+    // so an ungated frame is visible in the session log.
     mutable std::atomic<int> lastConfidenceThreshold_{0};
 
     std::mutex diagMutex_;

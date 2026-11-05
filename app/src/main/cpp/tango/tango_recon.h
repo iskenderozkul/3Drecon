@@ -36,9 +36,9 @@ public:
     TangoRecon(const TangoRecon&) = delete;
     TangoRecon& operator=(const TangoRecon&) = delete;
 
-    // maxDepth is only a ceiling: integration cost follows the measured depth
-    // actually fed in, and the engine feeds 6 m indoors and 7 m outdoors.
-    bool init(double resolution = 0.03, double maxDepth = 8.0);
+    // maxDepth matches the deepest sample the engine feeds; ARCore starts
+    // extrapolating past ~6 m, so a larger ceiling only stores noise.
+    bool init(double resolution = 0.03, double maxDepth = 6.0);
     // Rebuilds the volume with another profile. Kept for callers that need a
     // different grid; the engine no longer switches mid-scan because that
     // wiped everything captured so far.
@@ -107,7 +107,7 @@ private:
 
     Tango3DR_ReconstructionContext context_ = nullptr;
     double resolution_ = 0.03;
-    double maxDepth_ = 8.0;
+    double maxDepth_ = 6.0;
     std::vector<uint16_t> depthImage_;
     std::vector<uint8_t> colorImage_;
 
