@@ -782,7 +782,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
             kcy = frame.K.cy * sy;
         }
 
-        char line[512];
+        char line[640];
         char gateText[16];
         const float gateReject = lastConfidenceReject_.load();
         if (gateReject < 0.f) {
@@ -798,7 +798,8 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(depth_.depth.size());
         std::snprintf(line, sizeof(line),
                       "dense ts=%.3f src=t3dr dep=%dx%d feed=%dx%d valid=%.1f%% gate=%s "
-                      "cthr=%d dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d "
+                      "cthr=%d hold=%.0f%% fill=%.0f%% plane=%.0f%% "
+                      "dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d "
                       "dyn=%.1f%% ms=%.0f prep=%.1f fuse=%.1f feed=%.1f dynms=%.1f "
                       "upd=%.1f ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
                       "K=%.1f,%.1f,%.1f,%.1f q=%.3f,%.3f,%.3f,%.3f "
@@ -806,6 +807,9 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       ts, frame.depthWidth, frame.depthHeight, feedW_, feedH_,
                       total > 0 ? 100.0 * valid / total : 0.0, gateText,
                       lastConfidenceThreshold_.load(),
+                      static_cast<double>(lastFeedHeld_),
+                      static_cast<double>(lastFeedFill_),
+                      static_cast<double>(lastFeedPlane_),
                       static_cast<double>(dmin), static_cast<double>(dmed),
                       static_cast<double>(dmax), tango_.triangleCount(),
                       tango_.segmentCount(), tango_.pendingSegments(), dynamicPct,
@@ -1546,6 +1550,25 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
     const bool haveMask = motionMask_.size() == count;
     feedDepth_ = fusedDepth_;
 
+    // A pixel the sensor dropped is carried forward as a prediction warped
+    // from the previous pose. That prediction is useful inside the filter, but
+    // feeding it to the reconstruction stores geometry that was never measured
+    // in this frame, at a pose that has already moved: it is the shell that
+    // sits a few centimetres above a table and the patch that appears in free
+    // air. Only real measurements reach the volume.
+    int measured = 0;
+    int held = 0;
+    const bool haveAge = fusedAge_.size() == count;
+    for (size_t i = 0; i < count; ++i) {
+        if (feedDepth_[i] <= 0.f) continue;
+        if (haveAge && fusedAge_[i] > 0) {
+            feedDepth_[i] = 0.f;
+            ++held;
+        } else {
+            ++measured;
+        }
+    }
+
     // CPU luma resampled onto the depth grid through the inverse of the
     // measured depth transform, so the fill can follow colour edges.
     const float* m = frame.depthTransform;
@@ -1586,11 +1609,102 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
         }
     }
 
-    // Two joint-bilateral fill passes: a hole is closed only from neighbours
-    // with a similar colour and a consistent depth, so a doorway or a rim is
-    // not bridged. This is the image side of the fusion: where the sensor has
-    // no return, the colour image decides where the surface continues.
-    for (int pass = 0; pass < 2; ++pass) {
+    // A local plane is the strongest prior a depth sensor has on a wall,
+    // ceiling, tabletop or chair seat: in inverse depth a 3D plane is exactly
+    // linear in image coordinates, so a 5x5 least-squares fit removes the
+    // per-pixel ripple that marching cubes turns into visible waves. The fit
+    // is applied only when every sample agrees with it to a few millimetres,
+    // which leaves edges, chair rims and small objects at their measured
+    // depth. This runs on the feed copy, never on the filter state.
+    int snapped = 0;
+    {
+        const std::vector<float> planeSrc = feedDepth_;
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t i = static_cast<size_t>(y) * w + x;
+                const float d0 = planeSrc[i];
+                if (d0 <= 0.f) continue;
+                if (haveMask && motionMask_[i]) continue;
+                double s00 = 0, s01 = 0, s02 = 0, s11 = 0, s12 = 0, s22 = 0;
+                double b0 = 0, b1 = 0, b2 = 0;
+                float wv[25];
+                int duArr[25];
+                int dvArr[25];
+                int n = 0;
+                for (int dy = -2; dy <= 2; ++dy) {
+                    const int yy = y + dy;
+                    if (yy < 0 || yy >= h) continue;
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        const int xx = x + dx;
+                        if (xx < 0 || xx >= w) continue;
+                        const size_t j = static_cast<size_t>(yy) * w + xx;
+                        if (haveMask && motionMask_[j]) continue;
+                        const float d = planeSrc[j];
+                        if (d <= 0.f) continue;
+                        const double wj = 1.0 / static_cast<double>(d);
+                        const double u = static_cast<double>(dx);
+                        const double v = static_cast<double>(dy);
+                        s00 += u * u;
+                        s01 += u * v;
+                        s02 += u;
+                        s11 += v * v;
+                        s12 += v;
+                        s22 += 1.0;
+                        b0 += u * wj;
+                        b1 += v * wj;
+                        b2 += wj;
+                        wv[n] = static_cast<float>(wj);
+                        duArr[n] = dx;
+                        dvArr[n] = dy;
+                        ++n;
+                    }
+                }
+                if (n < 15) continue;
+                const double det = s00 * (s11 * s22 - s12 * s12) -
+                                   s01 * (s01 * s22 - s12 * s02) +
+                                   s02 * (s01 * s12 - s11 * s02);
+                if (std::fabs(det) < 1e-9) continue;
+                const double a = (b0 * (s11 * s22 - s12 * s12) -
+                                  s01 * (b1 * s22 - s12 * b2) +
+                                  s02 * (b1 * s12 - s11 * b2)) / det;
+                const double b = (s00 * (b1 * s22 - s12 * b2) -
+                                  b0 * (s01 * s22 - s12 * s02) +
+                                  s02 * (s01 * b2 - b1 * s02)) / det;
+                const double c = (s00 * (s11 * b2 - b1 * s12) -
+                                  s01 * (s01 * b2 - b1 * s02) +
+                                  b0 * (s01 * s12 - s11 * s02)) / det;
+                if (!(c > 1e-4)) continue;
+                double sumErr2 = 0.0;
+                double maxErr = 0.0;
+                bool rejected = false;
+                for (int k = 0; k < n; ++k) {
+                    const double wPred = a * duArr[k] + b * dvArr[k] + c;
+                    if (wPred <= 1e-4) { rejected = true; break; }
+                    const double err = std::fabs(1.0 / wPred - wv[k]);
+                    sumErr2 += err * err;
+                    maxErr = std::max(maxErr, err);
+                }
+                if (rejected) continue;
+                const double rms = std::sqrt(sumErr2 / static_cast<double>(n));
+                // Noise left after temporal fusion is ~1 cm; a genuine bump,
+                // edge or curved seat departs from the local plane much more.
+                const float tol = std::max(0.012f, 0.006f * d0);
+                if (rms > tol || maxErr > 2.5 * static_cast<double>(tol)) continue;
+                const float zFit = static_cast<float>(1.0 / c);
+                if (std::fabs(zFit - d0) > 0.04f) continue;
+                feedDepth_[i] = zFit;
+                ++snapped;
+            }
+        }
+    }
+
+    // One conservative joint-bilateral fill pass: a hole is closed only from
+    // neighbours with a similar colour and a consistent depth, so a doorway
+    // or a rim is not bridged. It used to run twice with a loose colour and
+    // depth tolerance; on a textured wall that was enough to grow a membrane
+    // across a hole, which then showed up in the volume as a surface in air.
+    int filled = 0;
+    {
         const std::vector<float> prev = feedDepth_;
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -1613,7 +1727,7 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
                         if (d <= 0.f) continue;
                         const int dl = lumaGrid_[j] > luma ? lumaGrid_[j] - luma
                                                            : luma - lumaGrid_[j];
-                        if (dl > 12) continue;
+                        if (dl > 8) continue;
                         donors[n++] = d;
                     }
                 }
@@ -1626,15 +1740,27 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
                 }
                 // Donors on both sides of a depth step would average into a
                 // sheet; leave the pixel as a real hole instead. The allowed
-                // step follows the range, so the 6 cm between a tabletop and a
-                // small object on it is a step, not an interpolation.
+                // step is tight so only a genuine dropout is closed.
                 const float fillTol =
-                    std::min(0.06f, std::max(0.02f, 0.035f * lo));
+                    std::min(0.03f, std::max(0.012f, 0.015f * lo));
                 if (hi - lo > fillTol) continue;
                 feedDepth_[i] = sum / static_cast<float>(n);
+                ++filled;
             }
         }
     }
+    lastFeedHeld_ = measured + held > 0
+                        ? 100.f * static_cast<float>(held) /
+                              static_cast<float>(measured + held)
+                        : 0.f;
+    lastFeedFill_ = measured > 0
+                        ? 100.f * static_cast<float>(filled) /
+                              static_cast<float>(measured)
+                        : 0.f;
+    lastFeedPlane_ = measured > 0
+                         ? 100.f * static_cast<float>(snapped) /
+                               static_cast<float>(measured)
+                         : 0.f;
 
     // A light guided smooth on what is left: the temporal filter removes most
     // of the noise, and this takes out the pixel steps that marching cubes

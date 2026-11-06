@@ -190,6 +190,12 @@ private:
     Intrinsics fusionK_;
     // Smoothed copy handed to the reconstruction (metres).
     std::vector<float> feedDepth_;
+    // Shares of the last feed: pixels that were held predictions (excluded),
+    // pixels synthesised by the colour-guided fill, and pixels snapped to a
+    // local plane. Logged because a high synth share explains air geometry.
+    float lastFeedHeld_ = 0.f;
+    float lastFeedFill_ = 0.f;
+    float lastFeedPlane_ = 0.f;
     // Millimetre grid handed to the reconstruction. The Tango core is
     // initialised with one depth resolution and does not survive a mid-session
     // switch to another one, so this is always the native 160x90 grid.
