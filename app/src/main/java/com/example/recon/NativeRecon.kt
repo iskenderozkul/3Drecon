@@ -33,7 +33,9 @@ object NativeRecon {
         depthTimestampNs: Long, depthApiActive: Boolean,
         confidence: ByteBuffer?, confidenceRowStride: Int, confidencePixelStride: Int,
         confidenceWidth: Int, confidenceHeight: Int,
-        depthInfo: FloatArray
+        depthInfo: FloatArray,
+        smoothDepth: ByteBuffer?, smoothRowStride: Int,
+        smoothWidth: Int, smoothHeight: Int
     )
 
     external fun render(

@@ -5,20 +5,20 @@
 >
 > Android 8.0+ · ARCore (Google Play Services for AR) gerekli.
 >
-> **Sürüm v2.6** (versionCode 8) — APK içinde ve oturum logunun başında da yazar.
-> v2.6 fixes what v2.5 silently did not do. (1) The local inverse-depth plane fit
-> compared a fitted depth in metres with an inverse-depth sample, so every residual
-> looked metres large and the fit never fired: `plane=` stayed at 0 % in every test
-> log. It is now computed in metres, estimated from the whole fused grid and written
-> only to genuinely measured pixels, with at most a 1.5 cm correction, so walls,
-> ceilings, tabletops and chair seats are flattened before the TSDF sees them.
-> (2) ARCore delivers a new depth map only every second or third render frame, and the
-> same grid was being fused again at a newer pose: one measurement stamped several
-> times at slightly different places, which is what thickens and stacks surfaces.
-> Only a new depth timestamp is integrated now, the same rule the reference scanner
-> uses. The dense log line gained `dup=`. v2.5 remains available as
-> `dist/3Drecon-v2.5.apk`, v2.4 as `dist/3Drecon-v2.4.apk`, v2.2 as
-> `dist/3Drecon-best-v2.2.apk`.
+> **Sürüm v2.7** (versionCode 9) — APK içinde ve oturum logunun başında da yazar.
+> v2.7 closes the last gap against the reference scanner's depth feed. ARCore's
+> **smoothed** depth map is now acquired alongside raw depth, and a smoothed value
+> replaces the raw sample wherever the two agree within 3 cm voxel widths (9 cm).
+> Flat walls, ceilings, tabletops and floors therefore reach the TSDF as ARCore's
+> filtered surface instead of raw per-pixel noise, while a real depth step keeps the
+> raw value because the smoothed map bridges it. The smoothed map never fills a raw
+> hole on its own: it is accepted there only when the raw neighbourhood on every side
+> is continuous and the value fits inside it. This is the substitution the reference
+> scanner performs before integration (`maxErrorFilter = 3·resolution`) and it is what
+> removes the cloud-like, cauliflower surface left in v2.6. The dense log line gained
+> `smooth=` (share of fed pixels taken from the smoothed map). v2.6 remains available
+> as `dist/3Drecon-v2.6.apk`, v2.5 as `dist/3Drecon-v2.5.apk`, v2.4 as
+> `dist/3Drecon-v2.4.apk`, v2.2 as `dist/3Drecon-best-v2.2.apk`.
 
 Real-time dense 3D reconstruction on a phone: ARCore provides live 6DoF tracking,
 camera frames and intrinsics; Google's Apache-2.0 **Tango 3D Reconstruction** core
@@ -126,6 +126,18 @@ blend between the measurement and the previous fused surface warped into the cur
   to keep more pixels, but on this device that let ARCore's interpolated ramps through and
   turned flat surfaces lumpy, so v2.4 restored the strict gate. The dense log line shows
   the rejection share as `gate=` and the threshold actually used as `cthr=`.
+- **Smoothed depth as the measurement, raw as the authority.** ARCore also returns a
+  filtered depth map for the same grid and frame. A raw sample is replaced by the
+  smoothed value when they agree within three voxels (9 cm): on a wall, a tabletop or
+  the floor they do, so the TSDF receives the filtered surface instead of per-pixel
+  noise, which is what marching cubes was turning into a cloudy, cauliflower surface.
+  On a silhouette the smoothed map bridges the step and the two disagree by more, so
+  the raw value survives there. Where raw has no sample the pixel stays a hole unless
+  the surrounding raw depths form a continuous surface and the smoothed value fits
+  inside it, so the smoothed map cannot invent a surface across a doorway or a rim.
+  This is the `maxErrorFilter = 3·resolution` step of the reference scanner, and the
+  dense log line reports it as `smooth=`. If a device returns no second map, the
+  engine silently keeps the raw-only path.
 - Cleaning tolerances scale with distance and are capped (median 2.5–10 cm, single-pixel
   fill 2–6 cm), so a ~6 cm object on a table is no longer bridged into a membrane by an
   absolute centimetre threshold meant for walls.
@@ -194,8 +206,9 @@ native stage that never finished. The dense line also splits the frame cost into
 optimisation can be aimed at whichever stage actually dominates instead of guessing.
 `hold=` is the share of pixels running on a held prediction (excluded from the feed),
 `fill=` the share synthesised by the colour-guided fill, `plane=` the share snapped
-to the local plane fit, and `dup=` the cumulative number of frames skipped because
-ARCore returned a depth map it had already delivered.
+to the local plane fit, `smooth=` the share taken from ARCore's smoothed depth map,
+and `dup=` the cumulative number of frames skipped because ARCore returned a depth
+map it had already delivered.
 
 The log is closed with `session_end=clean` in `onStop`, i.e. when the app leaves the
 foreground, and the same file is reopened with `session_resume=` when it returns. Swiping

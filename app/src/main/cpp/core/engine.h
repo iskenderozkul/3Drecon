@@ -196,6 +196,10 @@ private:
     float lastFeedHeld_ = 0.f;
     float lastFeedFill_ = 0.f;
     float lastFeedPlane_ = 0.f;
+    // Share of the last prepared frame whose measurement came from ARCore's
+    // smoothed depth map (agreed with raw, or closed a raw hole consistently).
+    // Logged so a dead second image is visible instead of only inferred.
+    float lastSmoothShare_ = 0.f;
     // Millimetre grid handed to the reconstruction. The Tango core is
     // initialised with one depth resolution and does not survive a mid-session
     // switch to another one, so this is always the native 160x90 grid.

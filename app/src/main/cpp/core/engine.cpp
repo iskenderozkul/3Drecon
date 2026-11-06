@@ -800,7 +800,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
             kcy = frame.K.cy * sy;
         }
 
-        char line[640];
+        char line[704];
         char gateText[16];
         const float gateReject = lastConfidenceReject_.load();
         if (gateReject < 0.f) {
@@ -816,7 +816,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(depth_.depth.size());
         std::snprintf(line, sizeof(line),
                       "dense ts=%.3f src=t3dr dep=%dx%d feed=%dx%d valid=%.1f%% gate=%s "
-                      "cthr=%d hold=%.0f%% fill=%.0f%% plane=%.0f%% dup=%d "
+                      "cthr=%d hold=%.0f%% fill=%.0f%% plane=%.0f%% smooth=%.0f%% dup=%d "
                       "dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d "
                       "dyn=%.1f%% ms=%.0f prep=%.1f fuse=%.1f feed=%.1f dynms=%.1f "
                       "upd=%.1f ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
@@ -828,6 +828,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(lastFeedHeld_),
                       static_cast<double>(lastFeedFill_),
                       static_cast<double>(lastFeedPlane_),
+                      static_cast<double>(lastSmoothShare_),
                       duplicateDepthSkips_,
                       static_cast<double>(dmin), static_cast<double>(dmed),
                       static_cast<double>(dmax), tango_.triangleCount(),
@@ -1076,6 +1077,36 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
         }
     }
 
+    // ARCore's smoothed map is the denoised version of the same surface. Take
+    // its value only where a confidence-gated raw sample agrees with it within
+    // three voxels: on a wall, a tabletop or the floor that is almost every
+    // pixel, so the volume sees the filtered surface instead of raw per-pixel
+    // noise; on a silhouette the two differ by much more (the smoothed map
+    // bridges the step), so raw stays the authority. This is the substitution
+    // the reference scanner performs before integration (maxErrorFilter =
+    // 3 * resolution) and it is what stops a flat surface from triangulating
+    // into a cloudy slab. The smoothed map never stands on its own: where raw
+    // has no sample, the pixel stays a hole unless a continuous raw
+    // neighbourhood corroborates it (checked in the median loop below).
+    int smoothTaken = 0;
+    std::vector<float> smoothSrc;
+    if (frame.hasSmoothDepth()) {
+        constexpr float kSmoothAgreeM = 0.09f;
+        smoothSrc.assign(count, 0.f);
+        for (size_t i = 0; i < count; ++i) {
+            const uint16_t mm = frame.smoothDepthMm[i];
+            if (mm == 0 || mm > maxMm) continue;
+            const float s = static_cast<float>(mm) * 0.001f;
+            smoothSrc[i] = s;
+            if (src[i] <= 0.f) continue;
+            if (std::fabs(s - src[i]) <= kSmoothAgreeM) {
+                src[i] = s;
+                ++smoothTaken;
+            }
+        }
+    }
+    const bool haveSmoothSrc = !smoothSrc.empty();
+
     lastConfidenceThreshold_.store(confidenceGate ? kMinConfidence : 0);
     lastConfidenceReject_.store(
         confidenceGate && rawValid > 0
@@ -1084,6 +1115,7 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
 
     depth.resize(dw, dh);
     int valid = 0;
+    int smoothFilled = 0;
     for (int y = 0; y < dh; ++y) {
         for (int x = 0; x < dw; ++x) {
             float window[9];
@@ -1141,8 +1173,19 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
                 const float fillTol =
                     std::min(0.08f, std::max(0.02f, 0.03f * (0.5f * (lo + hi))));
                 if (hi - lo <= fillTol) {
-                    std::sort(window, window + n);
-                    value = window[n / 2];
+                    const float smoothValue = haveSmoothSrc ? smoothSrc[q] : 0.f;
+                    if (smoothValue > 0.f && smoothValue >= lo - fillTol &&
+                        smoothValue <= hi + fillTol) {
+                        // The smoothed map closed this dropout consistently
+                        // with the raw surface on every side, so it is the
+                        // filtered estimate of the hole rather than an
+                        // invented surface.
+                        value = smoothValue;
+                        ++smoothFilled;
+                    } else {
+                        std::sort(window, window + n);
+                        value = window[n / 2];
+                    }
                 }
             }
             if (value > 0.f) {
@@ -1192,6 +1235,9 @@ bool Engine::prepareDepthGrid(const FrameInput& frame, DepthResult& depth,
         }
         valid = kept;
     }
+    lastSmoothShare_ = valid > 0 ? 100.f * static_cast<float>(smoothTaken + smoothFilled) /
+                                       static_cast<float>(valid)
+                                 : 0.f;
     hrDepthValid_.store(static_cast<float>(valid) / static_cast<float>(count));
     return valid >= static_cast<int>(static_cast<float>(count) * minValidFraction);
 }

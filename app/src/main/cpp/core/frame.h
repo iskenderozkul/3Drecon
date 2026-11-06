@@ -40,6 +40,15 @@ struct FrameInput {
     std::vector<uint8_t> confidence;
     int confidenceWidth = 0;
     int confidenceHeight = 0;
+    // ARCore's smoothed depth map (acquireDepthImage16Bits), same grid and
+    // timestamp as the raw one. Raw depth carries the sharp surface but also
+    // the per-pixel noise and the ramps ARCore blends across a silhouette;
+    // the smoothed map is the same surface with those filtered out. It is not
+    // trusted on its own (it bridges small depth steps), only where it agrees
+    // with a confidence-gated raw sample.
+    std::vector<uint16_t> smoothDepthMm;
+    int smoothWidth = 0;
+    int smoothHeight = 0;
     // CPU-image normalised (x,y) -> depth/texture normalised (u,v):
     // u = m[0]*x + m[1]*y + m[2], v = m[3]*x + m[4]*y + m[5].
     // ARCore crops its depth map to the display aspect ratio, so the depth map
@@ -59,6 +68,11 @@ struct FrameInput {
     bool hasConfidence() const {
         return confidenceWidth == depthWidth && confidenceHeight == depthHeight &&
                static_cast<int>(confidence.size()) == depthWidth * depthHeight;
+    }
+
+    bool hasSmoothDepth() const {
+        return smoothWidth == depthWidth && smoothHeight == depthHeight &&
+               static_cast<int>(smoothDepthMm.size()) == depthWidth * depthHeight;
     }
 
     bool valid() const {

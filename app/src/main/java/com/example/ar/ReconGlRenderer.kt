@@ -218,19 +218,24 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
         // Raw depth + confidence is the reconstruction input: the confidence
         // marks flying pixels on silhouettes and the values ARCore blended
         // across a depth step, which are the sheets that used to appear in
-        // mid-air. The smoothed image is the fallback when raw depth is not
-        // available on the device.
+        // mid-air. The smoothed map is acquired alongside it: the engine takes
+        // it only where it agrees with the raw sample, which replaces the
+        // per-pixel noise with ARCore's filtered surface while raw stays the
+        // authority at a real depth step. Without it the reconstruction
+        // triangulates raw noise into the cloudy, lumpy surface of v2.6. It
+        // remains the fallback when raw depth is not available at all.
         var depthImage: Image? = null
         var confidenceImage: Image? = null
+        var smoothDepthImage: Image? = null
         if (depthApiEnabled) {
             depthImage = runCatching { frame.acquireRawDepthImage16Bits() }.getOrNull()
             confidenceImage = runCatching { frame.acquireRawDepthConfidenceImage() }.getOrNull()
+            smoothDepthImage = runCatching { frame.acquireDepthImage16Bits() }.getOrNull()
             if (depthImage == null || confidenceImage == null) {
                 runCatching { depthImage?.close() }
                 runCatching { confidenceImage?.close() }
-                depthImage = null
-                confidenceImage = null
-                depthImage = runCatching { frame.acquireDepthImage16Bits() }.getOrNull()
+                depthImage = smoothDepthImage
+                smoothDepthImage = null
             }
         }
 
@@ -252,6 +257,7 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
             val v = image.planes[2]
             val dPlane = depthImage?.planes?.getOrNull(0)
             val cPlane = confidenceImage?.planes?.getOrNull(0)
+            val sPlane = smoothDepthImage?.planes?.getOrNull(0)
             if (depthImage != null) {
                 updateDepthTransform(frame, image.width, image.height)
                 updateDepthIntrinsics(camera, depthImage.width, depthImage.height)
@@ -274,7 +280,9 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
                 depthApiEnabled,
                 cPlane?.buffer, cPlane?.rowStride ?: 0, cPlane?.pixelStride ?: 0,
                 confidenceImage?.width ?: 0, confidenceImage?.height ?: 0,
-                depthInfo
+                depthInfo,
+                sPlane?.buffer, sPlane?.rowStride ?: 0,
+                smoothDepthImage?.width ?: 0, smoothDepthImage?.height ?: 0
             )
         } finally {
             // A stale image that ARCore already reclaimed must not throw from
@@ -282,6 +290,7 @@ class ReconGlRenderer : GLSurfaceView.Renderer {
             runCatching { image.close() }
             runCatching { depthImage?.close() }
             runCatching { confidenceImage?.close() }
+            runCatching { smoothDepthImage?.close() }
         }
     }
 

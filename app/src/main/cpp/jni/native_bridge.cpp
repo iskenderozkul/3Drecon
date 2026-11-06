@@ -81,7 +81,9 @@ void nativeSubmitFrame(JNIEnv* env, jobject, jlong handle,
                        jboolean depthApiActive,
                        jobject confidenceBuf, jint confidenceRowStride,
                        jint confidencePixelStride, jint confidenceWidth, jint confidenceHeight,
-                       jfloatArray depthInfoArr) {
+                       jfloatArray depthInfoArr,
+                       jobject smoothDepthBuf, jint smoothRowStride,
+                       jint smoothWidth, jint smoothHeight) {
     auto* c = ctx(handle);
     if (!c || width <= 1 || height <= 1) return;
 
@@ -163,6 +165,36 @@ void nativeSubmitFrame(JNIEnv* env, jobject, jlong handle,
                 } else {
                     frame.confidence.clear();
                 }
+            }
+        }
+    }
+
+    // ARCore's smoothed depth, same grid and frame as the raw map. It is only
+    // accepted when the dimensions match, so a device that returns a different
+    // resolution degrades to the raw-only path instead of mixing grids.
+    if (smoothDepthBuf && depthWidth > 1 && depthHeight > 1 &&
+        smoothWidth == depthWidth && smoothHeight == depthHeight) {
+        const auto* sPtr =
+            static_cast<const uint8_t*>(env->GetDirectBufferAddress(smoothDepthBuf));
+        const jlong capacity = env->GetDirectBufferCapacity(smoothDepthBuf);
+        const jlong rowBytes = static_cast<jlong>(smoothWidth) * 2;
+        if (sPtr && smoothRowStride >= rowBytes && capacity > 0) {
+            frame.smoothDepthMm.resize(static_cast<size_t>(smoothWidth) * smoothHeight);
+            bool complete = true;
+            for (int r = 0; r < smoothHeight; ++r) {
+                const jlong offset = static_cast<jlong>(r) * smoothRowStride;
+                if (offset + rowBytes > capacity) {
+                    complete = false;
+                    break;
+                }
+                std::memcpy(frame.smoothDepthMm.data() + static_cast<size_t>(r) * smoothWidth,
+                            sPtr + offset, static_cast<size_t>(rowBytes));
+            }
+            if (complete) {
+                frame.smoothWidth = smoothWidth;
+                frame.smoothHeight = smoothHeight;
+            } else {
+                frame.smoothDepthMm.clear();
             }
         }
     }
@@ -318,7 +350,7 @@ JNINativeMethod kMethods[] = {
     {"destroy", "(J)V", reinterpret_cast<void*>(nativeDestroy)},
     {"glInit", "(J)Z", reinterpret_cast<void*>(nativeGlInit)},
     {"glShutdown", "(J)V", reinterpret_cast<void*>(nativeGlShutdown)},
-    {"submitFrame", "(JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;IIIIJFFFFFFFFFFFZLjava/nio/ByteBuffer;IIIJZLjava/nio/ByteBuffer;IIII[F)V",
+    {"submitFrame", "(JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;IIIIJFFFFFFFFFFFZLjava/nio/ByteBuffer;IIIJZLjava/nio/ByteBuffer;IIII[FLjava/nio/ByteBuffer;III)V",
      reinterpret_cast<void*>(nativeSubmitFrame)},
     {"render", "(JI[F[F[FIII[F)Z", reinterpret_cast<void*>(nativeRender)},
     {"getStats", "(J[F[I)V", reinterpret_cast<void*>(nativeGetStats)},
