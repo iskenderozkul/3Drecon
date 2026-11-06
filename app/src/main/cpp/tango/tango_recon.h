@@ -21,9 +21,10 @@ namespace recon {
 // library (Apache 2.0), the same reconstruction core used by 3DLiveScanner.
 //
 // ARCore gives us a metric depth map and a 6DoF pose per frame. The library
-// turns them into a projective TSDF, runs marching cubes per 16^3 grid cell and
-// returns only the cells a frame touched. We keep those cells as cached
-// segments and publish them as one immutable MeshData for the GL thread.
+// turns the unprojected points into a TSDF (traversal update), runs marching
+// cubes per 16^3 grid cell and returns only the cells a frame touched. We keep
+// those cells as cached segments and publish them as one immutable MeshData for
+// the GL thread.
 //
 // The library is loaded with dlopen instead of a DT_NEEDED entry: if a device
 // cannot load it (for example an ABI/page-size mismatch), the engine can still
@@ -72,6 +73,7 @@ public:
     int pendingSegments() const { return pendingCount_.load(); }
     double lastUpdateMs() const { return lastUpdateMs_.load(); }
     double lastExtractMs() const { return lastExtractMs_.load(); }
+    int lastPointCount() const { return lastPointCount_.load(); }
     uint64_t integratedFrames() const { return integrated_.load(); }
 
     // Extracts the whole surface in one consistent state for export.
@@ -108,7 +110,9 @@ private:
     Tango3DR_ReconstructionContext context_ = nullptr;
     double resolution_ = 0.03;
     double maxDepth_ = 6.0;
-    std::vector<uint16_t> depthImage_;
+    // World-space XYZC points (4 floats each), rebuilt for every integrated
+    // frame from the filtered feed grid.
+    std::vector<float> cloudPoints_;
     std::vector<uint8_t> colorImage_;
 
     std::map<std::array<int, 3>, Segment> segments_;
@@ -133,6 +137,7 @@ private:
     std::atomic<int> pendingCount_{0};
     std::atomic<double> lastUpdateMs_{0.0};
     std::atomic<double> lastExtractMs_{0.0};
+    std::atomic<int> lastPointCount_{0};
     std::atomic<uint64_t> integrated_{0};
 };
 

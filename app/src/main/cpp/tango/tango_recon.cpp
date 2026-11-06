@@ -51,7 +51,7 @@ struct TangoApi {
     decltype(&Tango3DR_ReconstructionContext_destroy) contextDestroy = nullptr;
     decltype(&Tango3DR_ReconstructionContext_setDepthCalibration) setDepthCalibration = nullptr;
     decltype(&Tango3DR_ReconstructionContext_setColorCalibration) setColorCalibration = nullptr;
-    decltype(&Tango3DR_updateFromDepthImage) updateFromDepthImage = nullptr;
+    decltype(&Tango3DR_updateFromPointCloud) updateFromPointCloud = nullptr;
     decltype(&Tango3DR_extractMeshSegment) extractMeshSegment = nullptr;
     decltype(&Tango3DR_extractFullMesh) extractFullMesh = nullptr;
     decltype(&Tango3DR_Mesh_initEmpty) meshInitEmpty = nullptr;
@@ -80,7 +80,7 @@ struct TangoApi {
         RESOLVE(contextDestroy, Tango3DR_ReconstructionContext_destroy);
         RESOLVE(setDepthCalibration, Tango3DR_ReconstructionContext_setDepthCalibration);
         RESOLVE(setColorCalibration, Tango3DR_ReconstructionContext_setColorCalibration);
-        RESOLVE(updateFromDepthImage, Tango3DR_updateFromDepthImage);
+        RESOLVE(updateFromPointCloud, Tango3DR_updateFromPointCloud);
         RESOLVE(extractMeshSegment, Tango3DR_extractMeshSegment);
         RESOLVE(extractFullMesh, Tango3DR_extractFullMesh);
         RESOLVE(meshInitEmpty, Tango3DR_Mesh_initEmpty);
@@ -90,7 +90,7 @@ struct TangoApi {
 #undef RESOLVE
         ok = configCreate && configSetBool && configSetInt32 && configSetDouble &&
              configDestroy && contextCreate && contextDestroy && setDepthCalibration &&
-             setColorCalibration && updateFromDepthImage && extractMeshSegment &&
+             setColorCalibration && updateFromPointCloud && extractMeshSegment &&
              extractFullMesh && meshInitEmpty && meshDestroy && gridInitEmpty && gridDestroy;
         if (!ok) {
             LOGE("libtango_3d_reconstruction.so is missing entry points");
@@ -147,6 +147,24 @@ Intrinsics depthIntrinsics(const FrameInput& frame) {
     return K;
 }
 
+// Rotation matrix of the quaternion as stored in Tango3DR_Pose's (x,y,z,w)
+// fields, used to take an unprojected depth point from the camera optical
+// frame into world coordinates.
+inline void quatToMatrix(double x, double y, double z, double w, float out[9]) {
+    const double xx = x * x, yy = y * y, zz = z * z;
+    const double xy = x * y, xz = x * z, yz = y * z;
+    const double wx = w * x, wy = w * y, wz = w * z;
+    out[0] = static_cast<float>(1.0 - 2.0 * (yy + zz));
+    out[1] = static_cast<float>(2.0 * (xy - wz));
+    out[2] = static_cast<float>(2.0 * (xz + wy));
+    out[3] = static_cast<float>(2.0 * (xy + wz));
+    out[4] = static_cast<float>(1.0 - 2.0 * (xx + zz));
+    out[5] = static_cast<float>(2.0 * (yz - wx));
+    out[6] = static_cast<float>(2.0 * (xz - wy));
+    out[7] = static_cast<float>(2.0 * (yz + wx));
+    out[8] = static_cast<float>(1.0 - 2.0 * (xx + yy));
+}
+
 }  // namespace
 
 TangoRecon::~TangoRecon() {
@@ -183,7 +201,16 @@ bool TangoRecon::init(double resolution, double maxDepth) {
     a.configSetBool(config, "use_parallel_integration", true);
     // Reject only tiny extraction debris, not real objects.
     a.configSetInt32(config, "min_num_vertices", 9);
-    a.configSetInt32(config, "update_method", TANGO_3DR_PROJECTIVE_UPDATE);
+    // The reconstruction's default traversal update marches a ray from the
+    // camera to each measured point and updates every voxel it crosses. That is
+    // what makes a floor seen at a grazing angle close into one surface: the
+    // projective update only marks voxels that project inside the pixel
+    // footprint, so at a grazing angle it leaves a row of holes and the floor
+    // comes out as torn islands (the cloud-like debris seen up to v2.7). It is
+    // also the pair used by 3DLiveScanner on ARCore phones: traversal update
+    // with Tango3DR_updateFromPointCloud. The cost grows with the point count,
+    // but the filtered feed carries only a few thousand points per frame.
+    a.configSetInt32(config, "update_method", TANGO_3DR_TRAVERSAL_UPDATE);
 
     context_ = a.contextCreate(config);
     a.configDestroy(config);
@@ -282,12 +309,40 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
         static_cast<double>(frame.depthTimestampNs > 0 ? frame.depthTimestampNs
                                                        : frame.timestampNs) * 1e-9;
 
-    // DEPTH16 image, millimetres. The engine hands over its filtered copy
-    // (temporal fusion, hole filling, moving surfaces zeroed), so single-frame
-    // noise never reaches the volume.
-    depthImage_.resize(static_cast<size_t>(dw) * dh);
-    std::memcpy(depthImage_.data(), depthSource,
-                static_cast<size_t>(dw) * dh * sizeof(uint16_t));
+    // World-space point cloud. Traversal update does not use depth
+    // calibration: it marches the voxels along each camera-to-point ray, so
+    // the measurement itself is expressed in world coordinates. This mirrors
+    // the reference scanner, which unprojects the depth map through the camera
+    // pose before Tango3DR_updateFromPointCloud.
+    if (!(depthK.fx > 1.f && depthK.fy > 1.f && depthK.cx > 0.f && depthK.cy > 0.f)) {
+        return false;
+    }
+    float rot[9];
+    // (x,y,z,w) = (qw, qz, -qy, -qx): GL camera -> Tango optical frame.
+    quatToMatrix(static_cast<double>(frame.qw), static_cast<double>(frame.qz),
+                 -static_cast<double>(frame.qy), -static_cast<double>(frame.qx), rot);
+    constexpr float kMinDepthM = 0.20f;
+    const float maxDepthF = static_cast<float>(maxDepth_);
+    cloudPoints_.clear();
+    cloudPoints_.reserve(static_cast<size_t>(dw) * dh * 4);
+    for (int y = 0; y < dh; ++y) {
+        const uint16_t* row = depthSource + static_cast<size_t>(y) * dw;
+        for (int x = 0; x < dw; ++x) {
+            const uint16_t mm = row[x];
+            if (mm == 0) continue;
+            const float z = static_cast<float>(mm) * 0.001f;
+            if (z < kMinDepthM || z > maxDepthF) continue;
+            const float px = (static_cast<float>(x) - depthK.cx) / depthK.fx * z;
+            const float py = (static_cast<float>(y) - depthK.cy) / depthK.fy * z;
+            cloudPoints_.push_back(rot[0] * px + rot[1] * py + rot[2] * z + frame.tx);
+            cloudPoints_.push_back(rot[3] * px + rot[4] * py + rot[5] * z + frame.ty);
+            cloudPoints_.push_back(rot[6] * px + rot[7] * py + rot[8] * z + frame.tz);
+            cloudPoints_.push_back(1.f);
+        }
+    }
+    const size_t pointCount = cloudPoints_.size() / 4;
+    lastPointCount_.store(static_cast<int>(pointCount));
+    if (pointCount == 0) return false;
 
     // NV21: Y plane followed by interleaved V,U. Tango samples vertex colours
     // from this image with the colour intrinsics, so the 4:3 CPU frame keeps
@@ -303,13 +358,10 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
         vu[i * 2 + 1] = frame.u[static_cast<size_t>(i)];
     }
 
-    Tango3DR_ImageBuffer depthImage{};
-    depthImage.width = static_cast<uint32_t>(dw);
-    depthImage.height = static_cast<uint32_t>(dh);
-    depthImage.stride = static_cast<uint32_t>(dw * 2);
-    depthImage.timestamp = timestamp;
-    depthImage.format = TANGO_3DR_HAL_PIXEL_FORMAT_DEPTH16;
-    depthImage.data = reinterpret_cast<uint8_t*>(depthImage_.data());
+    Tango3DR_PointCloud cloud{};
+    cloud.timestamp = timestamp;
+    cloud.num_points = static_cast<uint32_t>(pointCount);
+    cloud.points = reinterpret_cast<Tango3DR_Vector4*>(cloudPoints_.data());
 
     Tango3DR_ImageBuffer colorImage{};
     colorImage.width = static_cast<uint32_t>(w);
@@ -346,13 +398,13 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
 
     const double start = nowSeconds();
     const Tango3DR_Status status =
-        a.updateFromDepthImage(context_, &depthImage, &pose, &colorImage, &pose, &updated);
+        a.updateFromPointCloud(context_, &cloud, &pose, &colorImage, &pose, &updated);
     lastUpdateMs_.store((nowSeconds() - start) * 1000.0);
     if (status != TANGO_3DR_SUCCESS) {
         static int failures = 0;
         if (failures < 3) {
-            LOGE("updateFromDepthImage failed: %d (depth %dx%d, color %dx%d)", status, dw, dh,
-                 w, h);
+            LOGE("updateFromPointCloud failed: %d (%u points, color %dx%d)", status,
+                 static_cast<unsigned>(pointCount), w, h);
             ++failures;
         }
         a.gridDestroy(&updated);
