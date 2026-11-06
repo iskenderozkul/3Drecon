@@ -147,24 +147,6 @@ Intrinsics depthIntrinsics(const FrameInput& frame) {
     return K;
 }
 
-// Rotation matrix of the quaternion as stored in Tango3DR_Pose's (x,y,z,w)
-// fields, used to take an unprojected depth point from the camera optical
-// frame into world coordinates.
-inline void quatToMatrix(double x, double y, double z, double w, float out[9]) {
-    const double xx = x * x, yy = y * y, zz = z * z;
-    const double xy = x * y, xz = x * z, yz = y * z;
-    const double wx = w * x, wy = w * y, wz = w * z;
-    out[0] = static_cast<float>(1.0 - 2.0 * (yy + zz));
-    out[1] = static_cast<float>(2.0 * (xy - wz));
-    out[2] = static_cast<float>(2.0 * (xz + wy));
-    out[3] = static_cast<float>(2.0 * (xy + wz));
-    out[4] = static_cast<float>(1.0 - 2.0 * (xx + zz));
-    out[5] = static_cast<float>(2.0 * (yz - wx));
-    out[6] = static_cast<float>(2.0 * (xz - wy));
-    out[7] = static_cast<float>(2.0 * (yz + wx));
-    out[8] = static_cast<float>(1.0 - 2.0 * (xx + yy));
-}
-
 }  // namespace
 
 TangoRecon::~TangoRecon() {
@@ -309,18 +291,17 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
         static_cast<double>(frame.depthTimestampNs > 0 ? frame.depthTimestampNs
                                                        : frame.timestampNs) * 1e-9;
 
-    // World-space point cloud. Traversal update does not use depth
-    // calibration: it marches the voxels along each camera-to-point ray, so
-    // the measurement itself is expressed in world coordinates. This mirrors
-    // the reference scanner, which unprojects the depth map through the camera
-    // pose before Tango3DR_updateFromPointCloud.
+    // Camera-space point cloud, exactly like the reference scanner, which
+    // multiplies its world-space points by inverse(pose) before handing them to
+    // Tango3DR_updateFromPointCloud. Feeding world-space points instead made the
+    // core apply the pose a second time: every point landed roughly 2x the pose
+    // offset away from the camera, outside max_depth, so no voxel was ever
+    // touched (tris=0 for the whole session, then the legacy fallback). Traversal
+    // update marches voxels from the camera pose to each point, so the points
+    // must be in the depth camera's own frame: X right, Y down, Z forward.
     if (!(depthK.fx > 1.f && depthK.fy > 1.f && depthK.cx > 0.f && depthK.cy > 0.f)) {
         return false;
     }
-    float rot[9];
-    // (x,y,z,w) = (qw, qz, -qy, -qx): GL camera -> Tango optical frame.
-    quatToMatrix(static_cast<double>(frame.qw), static_cast<double>(frame.qz),
-                 -static_cast<double>(frame.qy), -static_cast<double>(frame.qx), rot);
     constexpr float kMinDepthM = 0.20f;
     const float maxDepthF = static_cast<float>(maxDepth_);
     cloudPoints_.clear();
@@ -334,9 +315,9 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
             if (z < kMinDepthM || z > maxDepthF) continue;
             const float px = (static_cast<float>(x) - depthK.cx) / depthK.fx * z;
             const float py = (static_cast<float>(y) - depthK.cy) / depthK.fy * z;
-            cloudPoints_.push_back(rot[0] * px + rot[1] * py + rot[2] * z + frame.tx);
-            cloudPoints_.push_back(rot[3] * px + rot[4] * py + rot[5] * z + frame.ty);
-            cloudPoints_.push_back(rot[6] * px + rot[7] * py + rot[8] * z + frame.tz);
+            cloudPoints_.push_back(px);
+            cloudPoints_.push_back(py);
+            cloudPoints_.push_back(z);
             cloudPoints_.push_back(1.f);
         }
     }
@@ -439,6 +420,7 @@ bool TangoRecon::integrate(const FrameInput& frame, const DepthFeed* feed) {
         }
     }
 
+    lastUpdatedCells_.store(static_cast<int>(updated.num_indices));
     for (uint32_t i = 0; i < updated.num_indices; ++i) {
         const Tango3DR_GridIndex& index = updated.indices[i];
         const std::array<int, 3> key{index[0], index[1], index[2]};

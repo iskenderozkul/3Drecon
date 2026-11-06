@@ -819,7 +819,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       "cthr=%d hold=%.0f%% fill=%.0f%% plane=%.0f%% smooth=%.0f%% dup=%d "
                       "dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d "
                       "dyn=%.1f%% ms=%.0f prep=%.1f fuse=%.1f feed=%.1f dynms=%.1f "
-                      "upd=%.1f pts=%d ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
+                      "upd=%.1f pts=%d cells=%d ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
                       "K=%.1f,%.1f,%.1f,%.1f q=%.3f,%.3f,%.3f,%.3f "
                       "seed=%d run=%d wskip=%d rel=%.2f ang=%.2f",
                       ts, frame.depthWidth, frame.depthHeight, feedW_, feedH_,
@@ -837,6 +837,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(fuseMs), static_cast<double>(feedMs),
                       static_cast<double>(dynMs),
                       tango_.lastUpdateMs(), tango_.lastPointCount(),
+                      tango_.lastUpdatedCells(),
                       tango_.lastExtractMs(),
                       static_cast<double>(frame.tx),
                       static_cast<double>(frame.ty), static_cast<double>(frame.tz),

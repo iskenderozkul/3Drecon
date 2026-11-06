@@ -74,6 +74,7 @@ public:
     double lastUpdateMs() const { return lastUpdateMs_.load(); }
     double lastExtractMs() const { return lastExtractMs_.load(); }
     int lastPointCount() const { return lastPointCount_.load(); }
+    int lastUpdatedCells() const { return lastUpdatedCells_.load(); }
     uint64_t integratedFrames() const { return integrated_.load(); }
 
     // Extracts the whole surface in one consistent state for export.
@@ -110,8 +111,9 @@ private:
     Tango3DR_ReconstructionContext context_ = nullptr;
     double resolution_ = 0.03;
     double maxDepth_ = 6.0;
-    // World-space XYZC points (4 floats each), rebuilt for every integrated
-    // frame from the filtered feed grid.
+    // Camera-space XYZC points (4 floats each), rebuilt for every integrated
+    // frame from the filtered feed grid. The core applies the depth pose to
+    // them, so they must not be pre-transformed into world coordinates.
     std::vector<float> cloudPoints_;
     std::vector<uint8_t> colorImage_;
 
@@ -138,6 +140,7 @@ private:
     std::atomic<double> lastUpdateMs_{0.0};
     std::atomic<double> lastExtractMs_{0.0};
     std::atomic<int> lastPointCount_{0};
+    std::atomic<int> lastUpdatedCells_{0};
     std::atomic<uint64_t> integrated_{0};
 };
 
