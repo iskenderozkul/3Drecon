@@ -219,6 +219,11 @@ private:
     int fuseWarpSkips_ = 0;
     float lastRelLength_ = 0.f;
     float lastRelAngle_ = 0.f;
+    // ARCore delivers a new depth map only every second or third render frame.
+    // Re-integrating the same grid at a newer pose stamps one measurement over
+    // and over, which thickens every surface, so only a new timestamp is fused.
+    int64_t lastDepthTimestampNs_ = 0;
+    int duplicateDepthSkips_ = 0;
     std::shared_ptr<const MeshData> dynamicSnapshot_ = std::make_shared<MeshData>();
     mutable std::mutex dynamicMutex_;
     uint32_t dynamicVersion_ = 0;

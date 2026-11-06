@@ -346,6 +346,8 @@ void Engine::performReset() {
     fuseSeeds_ = 0;
     fuseRuns_ = 0;
     fuseWarpSkips_ = 0;
+    lastDepthTimestampNs_ = 0;
+    duplicateDepthSkips_ = 0;
     lastRelLength_ = 0.f;
     lastRelAngle_ = 0.f;
     motionScore_.clear();
@@ -646,6 +648,22 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
         }
     }
 
+    // ARCore ships a new depth map only every second or third render frame on
+    // this device (the timestamp advances in ~33 ms steps while the camera runs
+    // at 60). The same grid fused again at a newer pose is one measurement
+    // stamped at several slightly different places, and that is what turns a
+    // wall into a thick lumpy slab. Only a new timestamp is worth integrating;
+    // the temporal filter keeps its own state between those frames. The
+    // reference scanner updates once per new depth timestamp for the same
+    // reason.
+    if (frame.depthApiActive && frame.depthTimestampNs > 0) {
+        if (frame.depthTimestampNs == lastDepthTimestampNs_) {
+            ++duplicateDepthSkips_;
+            return false;
+        }
+        lastDepthTimestampNs_ = frame.depthTimestampNs;
+    }
+
     // The cleaned grid is what gets fused: median-rejected flyers would
     // otherwise form sheets between foreground and background, and moving
     // pixels are zeroed so a walking person does not smear the room.
@@ -798,7 +816,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(depth_.depth.size());
         std::snprintf(line, sizeof(line),
                       "dense ts=%.3f src=t3dr dep=%dx%d feed=%dx%d valid=%.1f%% gate=%s "
-                      "cthr=%d hold=%.0f%% fill=%.0f%% plane=%.0f%% "
+                      "cthr=%d hold=%.0f%% fill=%.0f%% plane=%.0f%% dup=%d "
                       "dmin=%.2f dmed=%.2f dmax=%.2f tris=%d seg=%d pend=%d "
                       "dyn=%.1f%% ms=%.0f prep=%.1f fuse=%.1f feed=%.1f dynms=%.1f "
                       "upd=%.1f ex=%.1f pos=%.2f,%.2f,%.2f lag=%.0f "
@@ -810,6 +828,7 @@ bool Engine::processDepthFrame(const FrameInput& frame) {
                       static_cast<double>(lastFeedHeld_),
                       static_cast<double>(lastFeedFill_),
                       static_cast<double>(lastFeedPlane_),
+                      duplicateDepthSkips_,
                       static_cast<double>(dmin), static_cast<double>(dmed),
                       static_cast<double>(dmax), tango_.triangleCount(),
                       tango_.segmentCount(), tango_.pendingSegments(), dynamicPct,
@@ -1612,18 +1631,21 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
     // A local plane is the strongest prior a depth sensor has on a wall,
     // ceiling, tabletop or chair seat: in inverse depth a 3D plane is exactly
     // linear in image coordinates, so a 5x5 least-squares fit removes the
-    // per-pixel ripple that marching cubes turns into visible waves. The fit
-    // is applied only when every sample agrees with it to a few millimetres,
-    // which leaves edges, chair rims and small objects at their measured
-    // depth. This runs on the feed copy, never on the filter state.
+    // per-pixel ripple that marching cubes turns into visible waves. The fit is
+    // estimated from the whole fused grid (held predictions included, they sit
+    // on the same surface) but only measured pixels are rewritten, so the plane
+    // never invents depth. Edge and curved pixels fail the residual test and
+    // keep their measured value. This runs on the feed copy, never on the
+    // filter state.
     int snapped = 0;
     {
-        const std::vector<float> planeSrc = feedDepth_;
+        const std::vector<float>& planeSrc = fusedDepth_;
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
                 const size_t i = static_cast<size_t>(y) * w + x;
                 const float d0 = planeSrc[i];
                 if (d0 <= 0.f) continue;
+                if (haveAge && fusedAge_[i] > 0) continue;
                 if (haveMask && motionMask_[i]) continue;
                 double s00 = 0, s01 = 0, s02 = 0, s11 = 0, s12 = 0, s22 = 0;
                 double b0 = 0, b1 = 0, b2 = 0;
@@ -1659,7 +1681,7 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
                         ++n;
                     }
                 }
-                if (n < 15) continue;
+                if (n < 10) continue;
                 const double det = s00 * (s11 * s22 - s12 * s12) -
                                    s01 * (s01 * s22 - s12 * s02) +
                                    s02 * (s01 * s12 - s11 * s02);
@@ -1680,18 +1702,29 @@ void Engine::buildFusionFeed(const FrameInput& frame) {
                 for (int k = 0; k < n; ++k) {
                     const double wPred = a * duArr[k] + b * dvArr[k] + c;
                     if (wPred <= 1e-4) { rejected = true; break; }
-                    const double err = std::fabs(1.0 / wPred - wv[k]);
+                    // Both sides in metres: wv holds 1/z, so a fitted depth is
+                    // 1/wPred. Differencing the fitted depth against 1/z (as
+                    // v2.5 did) mixed metres with inverse metres, which made
+                    // every residual look metres large and the fit never fire.
+                    const double err =
+                        std::fabs(1.0 / wPred - 1.0 / static_cast<double>(wv[k]));
                     sumErr2 += err * err;
                     maxErr = std::max(maxErr, err);
                 }
                 if (rejected) continue;
                 const double rms = std::sqrt(sumErr2 / static_cast<double>(n));
-                // Noise left after temporal fusion is ~1 cm; a genuine bump,
-                // edge or curved seat departs from the local plane much more.
-                const float tol = std::max(0.012f, 0.006f * d0);
+                // After temporal fusion a plane's residual is a few millimetres
+                // when still and about a centimetre while walking; an edge or a
+                // curved seat departs by much more. The band is the sensor's
+                // own noise floor, not an arbitrary constant.
+                const float tol = std::max(0.015f, 0.007f * d0);
                 if (rms > tol || maxErr > 2.5 * static_cast<double>(tol)) continue;
                 const float zFit = static_cast<float>(1.0 / c);
-                if (std::fabs(zFit - d0) > 0.04f) continue;
+                // Snap only small corrections: a fitted value far from the
+                // measurement is a nearby surface (a tabletop against its edge),
+                // and moving the pixel onto it would offset real geometry.
+                const float maxShift = std::max(0.015f, 0.010f * d0);
+                if (std::fabs(zFit - d0) > maxShift) continue;
                 feedDepth_[i] = zFit;
                 ++snapped;
             }
